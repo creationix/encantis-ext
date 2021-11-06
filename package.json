@@ -1,0 +1,64 @@
+{
+  "name": "encantis-vscode-ext",
+  "displayName": "Encantis Language",
+  "version": "0.0.1",
+  "repository": "https://github.com/creationix/encantis-ext",
+  "publisher": "creationix",
+  "icon": "./icon-128.png",
+  "type": "module",
+  "engines": {
+    "vscode": "^1.40.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "themes": [
+      {
+        "label": "Notebook Dark",
+        "uiTheme": "vs-dark",
+        "path": "./dark-color-theme.json"
+      },
+      {
+        "label": "Notebook Light",
+        "uiTheme": "vs",
+        "path": "./light-color-theme.json"
+      }
+    ],
+    "languages": [
+      {
+        "id": "encantis",
+        "aliases": [
+          "encantis",
+          "ents"
+        ],
+        "extensions": [
+          ".ents",
+          ".encantis"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "encantis-injection"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "encantis",
+        "scopeName": "source.encantis",
+        "path": "encantis.tmlanguage.json"
+      },
+      {
+        "language": "encantis-injection",
+        "scopeName": "markdown.encantis.codeblock",
+        "path": "./codeblock.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.encantis": "encantis"
+        }
+      }
+    ]
+  }
+}
