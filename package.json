@@ -1,7 +1,7 @@
 {
   "name": "encantis-vscode-ext",
   "displayName": "Encantis Language",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "repository": "https://github.com/creationix/encantis-ext",
   "publisher": "creationix",
   "icon": "./icon-128.png",
@@ -13,18 +13,6 @@
     "Programming Languages"
   ],
   "contributes": {
-    "themes": [
-      {
-        "label": "Notebook Dark",
-        "uiTheme": "vs-dark",
-        "path": "./dark-color-theme.json"
-      },
-      {
-        "label": "Notebook Light",
-        "uiTheme": "vs",
-        "path": "./light-color-theme.json"
-      }
-    ],
     "languages": [
       {
         "id": "encantis",
