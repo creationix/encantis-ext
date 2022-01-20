@@ -48,11 +48,11 @@
                 },
                 {
                     "name": "keyword.operator.assignment.augmented.encantis",
-                    "match": "%=|&=|\\*=|\\+=|-=|/=|\\^=|\\|=|<<=|>>=|\\|\\|=|\\?\\?="
+                    "match": "<<<=|>>>=|%=|&=|\\*=|\\+=|-=|/=|\\^=|\\|=|<<=|>>=|\\|\\|=|\\?\\?="
                 },
                 {
                     "name": "keyword.operator.bitwise.encantis",
-                    "match": "<<|>>|&|\\^|\\|"
+                    "match": "<<<|>>>|<<|>>|&|\\^|\\|"
                 },
                 {
                     "name": "keyword.operator.comparison.encantis",
@@ -80,19 +80,19 @@
             "patterns": [
                 {
                     "name": "keyword.control.block.encantis",
-                    "match": "\\b(block|loop|forever|when|unless|if|while|for|br-if|br|break|continue)(-[0-9A-Za-z_-]*)?\\b"
+                    "match": "\\b(block|loop|forever|while|for|in|func|if|then|elif|else|do|end)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "keyword.control.encantis",
-                    "match": "\\b(func|then|elif|else|end|in|do|return-if|return)\\b"
+                    "match": "\\b(return|br|break|continue|when|unless)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "storage.type.encantis",
-                    "match": "\\b(func|param|result|memory|import|export|define|type|interface|global|local)\\b"
+                    "match": "\\b(memory|import|export|define|type|interface|global|local|as)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "keyword.logic.encantis",
-                    "match": "\\b(or|and|not|xor|as)\\b"
+                    "match": "\\b(or|and|not|xor)(?![a-zA-Z0-9_-])"
                 }
             ]
         },
@@ -114,23 +114,31 @@
             "patterns": [
                 {
                     "name": "entity.name.type.encantis",
-                    "match": "\\b(u8|i8|u16|i16|u32|i32|u64|i64|f32|f64|void)\\b"
+                    "match": "\\b(u8|i8|u16|i16|u32|i32|u64|i64|f32|f64)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "support.type.encantis",
-                    "match": "\\b([A-Z][0-9A-Za-z_-]*)\\b"
+                    "match": "\\b([A-Z][0-9A-Za-z_-]*)"
                 },
                 {
                     "name": "support.function.encantis",
-                    "match": "\\b(sqrt|ceil|floor|round)\\b"
+                    "match": "\\b(sqrt|ceil|floor|round)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "punctuation.accessor.tuple.encantis",
-                    "match": "(?<=[a-z])\\.[0-9]+"
+                    "match": "(?<=[a-zA-Z0-9_-])\\.[0-9]+"
+                },
+                {
+                    "name": "punctuation.accessor.property.encantis",
+                    "match": "(?<=[a-zA-Z0-9_-])\\.[a-z][0-9A-Za-z_-]*"
+                },
+                {
+                    "name": "punctuation.accessor.pointer.encantis",
+                    "match": "(?<=[a-zA-Z0-9_-])\\.\\*"
                 },
                 {
                     "name": "variable.encantis",
-                    "match": "\\b[a-z][0-9A-Za-z_-]*\\b"
+                    "match": "\\b[a-z][0-9A-Za-z_-]*"
                 }
             ]
         },
@@ -138,23 +146,23 @@
             "patterns": [
                 {
                     "name": "constant.numeric.hexadecimal",
-                    "match": "0[xX][0-9a-fA-F]+(UL|U|L)?"
+                    "match": "0[xX][0-9a-fA-F]+(\\.[0-9a-fA-F]+)?"
                 },
                 {
                     "name": "constant.numeric.binary",
-                    "match": "0[bB][0-1]+(UL|U|L)?"
+                    "match": "0[bB][0-1]+(\\.[0-1]+)?"
                 },
                 {
                     "name": "constant.numeric.octal",
-                    "match": "0[oO][0-7]+(UL|U|L)?"
+                    "match": "0[oO][0-7]+(\\.[0-7]+)?"
                 },
                 {
                     "name": "constant.numeric.dozenal",
-                    "match": "0[dD][0-9a-bA-B]+(UL|U|L)?"
+                    "match": "0[dD][0-9a-bA-B]+(\\.[0-9a-bA-B]+)?"
                 },
                 {
                     "name": "constant.numeric",
-                    "match": "[0-9]+(UL|U|L)?"
+                    "match": "[0-9]+(\\.[0-9]+)?"
                 }
             ]
         }
