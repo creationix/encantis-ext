@@ -4,7 +4,7 @@
   "version": "0.0.2",
   "repository": "https://github.com/creationix/encantis-ext",
   "publisher": "creationix",
-  "icon": "./icon-128.png",
+  "icon": "icon-128.png",
   "type": "module",
   "engines": {
     "vscode": "^1.40.0"
