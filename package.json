@@ -1,7 +1,7 @@
 {
   "name": "encantis-vscode-ext",
   "displayName": "Encantis Language",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "repository": "https://github.com/creationix/encantis-ext",
   "publisher": "creationix",
   "icon": "icon-128.png",
