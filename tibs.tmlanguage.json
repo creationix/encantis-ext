@@ -1,0 +1,245 @@
+{
+	"name": "tibs",
+	"scopeName": "source.tibs",
+	"patterns": [
+		{
+			"include": "#value"
+		}
+	],
+	"repository": {
+		"array": {
+			"begin": "\\[\\#?",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.array.begin.tibs"
+				}
+			},
+			"end": "\\]",
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.array.end.tibs"
+				}
+			},
+			"name": "meta.structure.array.tibs",
+			"patterns": [
+				{
+					"include": "#value"
+				},
+				{
+					"match": ",",
+					"name": "punctuation.separator.array.tibs"
+				},
+				{
+					"match": "[^\\s\\]]",
+					"name": "invalid.illegal.expected-array-separator.tibs"
+				}
+			]
+		},
+		"scope": {
+			"begin": "\\(",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.scope.begin.tibs"
+				}
+			},
+			"end": "\\)",
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.scope.end.tibs"
+				}
+			},
+			"name": "meta.structure.scope.tibs",
+			"patterns": [
+				{
+					"include": "#value"
+				},
+				{
+					"match": ",",
+					"name": "punctuation.separator.scope.tibs"
+				},
+				{
+					"match": "[^\\s\\]]",
+					"name": "invalid.illegal.expected-scope-separator.tibs"
+				}
+			]
+		},
+        "bytes": {
+			"begin": "\\<",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.bytes.begin.tibs"
+				}
+			},
+			"end": "\\>",
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.bytes.end.tibs"
+				}
+			},
+			"name": "meta.structure.bytes.tibs",
+			"patterns": [
+				{
+					"match": "([0-9a-fA-F][0-9a-fA-F])+",
+                    "name": "support.bytes.tibs"
+				},
+				{
+                    "include": "#comments"
+				},
+				{
+					"match": "[^\\s\\>]",
+					"name": "invalid.illegal.expected-bytes-separator.tibs"
+				}
+			]
+		},
+
+		"comments": {
+			"patterns": [
+				{
+					"captures": {
+						"1": {
+							"name": "punctuation.definition.comment.tibs"
+						}
+					},
+					"match": "(//).*$\\n?",
+					"name": "comment.line.double-slash.js"
+				}
+			]
+		},
+		"constant": {
+			"match": "\\b(?:true|false|null)\\b",
+			"name": "constant.language.tibs"
+		},
+		"number": {
+            "patterns": [
+                {
+                    "match": "\\b(?:nan|inf|\\-inf)\\b",
+                    "name": "constant.numeric.special.tibs"
+                },
+                {
+                    "match": "(?x)        # turn on extended mode\n  -?        # an optional minus\n  (?:\n    0       # a zero\n    |       # ...or...\n    [1-9]   # a 1-9 character\n    \\d*     # followed by zero or more digits\n  )\n  (?:\n    (?:\n      \\.    # a period\n      \\d+   # followed by one or more digits\n    )?\n    (?:\n      [eE]  # an e character\n      [+-]? # followed by an option +/-\n      \\d+   # followed by one or more digits\n    )?      # make exponent optional\n  )?        # make decimal portion optional",
+                    "name": "constant.numeric.tibs"
+                }
+            ]
+        },
+        "ref": {
+            "match": "\\&[0-9]+",
+            "name": "entity.name.ref.tibs"
+        },
+		"object": {
+			"begin": "\\{",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.dictionary.begin.tibs"
+				}
+			},
+			"end": "\\}",
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.dictionary.end.tibs"
+				}
+			},
+			"name": "meta.structure.dictionary.tibs",
+			"patterns": [
+				{
+					"comment": "the tibs object key",
+					"include": "#value"
+				},
+				{
+					"include": "#comments"
+				},
+				{
+					"begin": ":",
+					"beginCaptures": {
+						"0": {
+							"name": "punctuation.separator.dictionary.key-value.tibs"
+						}
+					},
+					"end": "(,)|(?=\\})",
+					"endCaptures": {
+						"1": {
+							"name": "punctuation.separator.dictionary.pair.tibs"
+						}
+					},
+					"name": "meta.structure.dictionary.value.tibs",
+					"patterns": [
+						{
+							"comment": "the tibs object value",
+							"include": "#value"
+						},
+						{
+							"match": "[^\\s,]",
+							"name": "invalid.illegal.expected-dictionary-separator.tibs"
+						}
+					]
+				},
+				{
+					"match": "[^\\s\\}]",
+					"name": "invalid.illegal.expected-dictionary-separator.tibs"
+				}
+			]
+		},
+		"string": {
+			"begin": "\"",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.string.begin.tibs"
+				}
+			},
+			"end": "\"",
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.string.end.tibs"
+				}
+			},
+			"name": "string.quoted.double.tibs",
+			"patterns": [
+				{
+					"include": "#stringcontent"
+				}
+			]
+		},
+		"stringcontent": {
+			"patterns": [
+				{
+					"match": "(?x)                # turn on extended mode\n  \\\\                # a literal backslash\n  (?:               # ...followed by...\n    [\"\\\\/bfnrt]     # one of these characters\n    |               # ...or...\n    u               # a u\n    [0-9a-fA-F]{4}) # and four hex digits",
+					"name": "constant.character.escape.tibs"
+				},
+				{
+					"match": "\\\\.",
+					"name": "invalid.illegal.unrecognized-string-escape.tibs"
+				}
+			]
+		},
+		"value": {
+			"patterns": [
+				{
+					"include": "#constant"
+				},
+				{
+					"include": "#number"
+				},
+				{
+					"include": "#string"
+				},
+				{
+					"include": "#array"
+				},
+				{
+					"include": "#object"
+				},
+				{
+					"include": "#scope"
+				},
+				{
+					"include": "#ref"
+				},
+				{
+					"include": "#bytes"
+				},
+				{
+					"include": "#comments"
+				}
+			]
+		}
+	}
+}

@@ -3,12 +3,12 @@
 	"injectionSelector": "L:text.html.markdown",
 	"patterns": [
 		{
-			"include": "#encantis-code-block"
+			"include": "#tibs-code-block"
 		}
 	],
 	"repository": {
-		"encantis-code-block": {
-			"begin": "(^|\\G)(\\s*)(\\`{3,}|~{3,})\\s*(?i:(encantis|ents)(\\s+[^`~]*)?$)",
+		"tibs-code-block": {
+			"begin": "(^|\\G)(\\s*)(\\`{3,}|~{3,})\\s*(?i:(tibs)(\\s+[^`~]*)?$)",
 			"name": "markup.fenced_code.block.markdown",
 			"end": "(^|\\G)(\\2|\\s{0,3})(\\3)\\s*$",
 			"beginCaptures": {
@@ -31,15 +31,15 @@
 				{
 					"begin": "(^|\\G)(\\s*)(.*)",
 					"while": "(^|\\G)(?!\\s*([`~]{3,})\\s*$)",
-					"contentName": "meta.embedded.block.encantis",
+					"contentName": "meta.embedded.block.tibs",
 					"patterns": [
 						{
-							"include": "source.encantis"
+							"include": "source.tibs"
 						}
 					]
 				}
 			]
 		}
 	},
-	"scopeName": "markdown.encantis.codeblock"
+	"scopeName": "markdown.tibs.codeblock"
 }

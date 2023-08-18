@@ -1,10 +1,10 @@
 {
-  "name": "encantis-vscode-ext",
-  "displayName": "Encantis Language",
-  "version": "0.0.3",
-  "repository": "https://github.com/creationix/encantis-ext",
+  "name": "nibs-vscode-ext",
+  "displayName": "Nibs/Tibs Formats",
+  "version": "0.0.1",
+  "repository": "https://github.com/creationix/nibs-ext",
   "publisher": "creationix",
-  "icon": "icon-128.png",
+  "icon": "nibs-logo-256.png",
   "type": "module",
   "engines": {
     "vscode": "^1.40.0"
@@ -15,36 +15,34 @@
   "contributes": {
     "languages": [
       {
-        "id": "encantis",
+        "id": "tibs",
         "aliases": [
-          "encantis",
-          "ents"
+          "tibs"
         ],
         "extensions": [
-          ".ents",
-          ".encantis"
+          ".tibs"
         ],
         "configuration": "./language-configuration.json"
       },
       {
-        "id": "encantis-injection"
+        "id": "tibs-injection"
       }
     ],
     "grammars": [
       {
-        "language": "encantis",
-        "scopeName": "source.encantis",
-        "path": "encantis.tmlanguage.json"
+        "language": "tibs",
+        "scopeName": "source.tibs",
+        "path": "tibs.tmlanguage.json"
       },
       {
-        "language": "encantis-injection",
-        "scopeName": "markdown.encantis.codeblock",
+        "language": "tibs-injection",
+        "scopeName": "markdown.tibs.codeblock",
         "path": "./codeblock.json",
         "injectTo": [
           "text.html.markdown"
         ],
         "embeddedLanguages": {
-          "meta.embedded.block.encantis": "encantis"
+          "meta.embedded.block.tibs": "tibs"
         }
       }
     ]
