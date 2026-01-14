@@ -41,7 +41,11 @@
           ".ents",
           ".encantis"
         ],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/encantis-file.svg",
+          "dark": "./icons/encantis-file.svg"
+        }
       },
       {
         "id": "encantis-injection"
@@ -67,7 +71,8 @@
     ],
     "configurationDefaults": {
       "[encantis]": {
-        "editor.semanticHighlighting.enabled": true
+        "editor.semanticHighlighting.enabled": true,
+        "editor.wordSeparators": "`~!@#$%^&*()=+[{]}\\|;:'\",.<>/?"
       }
     },
     "semanticTokenScopes": [
@@ -75,6 +80,7 @@
         "language": "encantis",
         "scopes": {
           "parameter": ["variable.parameter.encantis"],
+          "parameter.output": ["variable.parameter.output.encantis"],
           "variable": ["variable.other.local.encantis"],
           "variable.static": ["variable.other.global.encantis"],
           "function": ["entity.name.function.encantis"]

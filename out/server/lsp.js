@@ -21,7 +21,7 @@ let hasWorkspaceFolderCapability = false;
 // -----------------------------------------------------------------------------
 // Token types - order matters, these are indices
 const tokenTypes = [
-    'parameter', // 0 - function parameters
+    'parameter', // 0 - function parameters (input and named returns, distinguished by modifier)
     'variable', // 1 - local variables and globals (distinguished by modifier)
     'function', // 2 - function names
 ];
@@ -31,6 +31,7 @@ const tokenModifiers = [
     'static', // 1 (bit 1 = 2) - global/static variables
     'modification', // 2 (bit 2 = 4) - where a variable is being modified
     'readonly', // 3 (bit 3 = 8) - immutable variables
+    'output', // 4 (bit 4 = 16) - named return parameters (output params)
 ];
 const semanticTokensLegend = {
     tokenTypes,
@@ -470,39 +471,44 @@ connection.languages.semanticTokens.on((params) => {
                 addToken({ start: nameStart, end: nameEnd }, 2, 1); // function + declaration
             }
         }
+        // Collect named return names first (for checking if input params are also outputs)
+        const namedReturnNames = new Set();
+        if (func.returnType && 'params' in func.returnType) {
+            const namedReturn = func.returnType;
+            for (const ret of namedReturn.params) {
+                namedReturnNames.add(ret.name);
+            }
+        }
         // Parameters - use their spans from the AST
+        // If param name is also a named return, tag it with output modifier
         for (const param of func.params) {
             if (param.span) {
+                const isAlsoOutput = namedReturnNames.has(param.name);
+                const modifiers = isAlsoOutput ? (1 | 16) : 1; // declaration + (output if applicable)
                 // The param span includes the type annotation, we need just the name
                 const paramText = text.slice(param.span.start, param.span.end);
                 const colonIdx = paramText.indexOf(':');
                 if (colonIdx > 0) {
                     const nameEnd = param.span.start + colonIdx;
-                    addToken({ start: param.span.start, end: nameEnd }, 0, 1); // parameter + declaration
+                    addToken({ start: param.span.start, end: nameEnd }, 0, modifiers); // parameter
                 }
                 else {
                     // No type annotation, whole span is the name
-                    addToken(param.span, 0, 1); // parameter + declaration
+                    addToken(param.span, 0, modifiers); // parameter
                 }
             }
         }
         // Named return values like -> (h64: u64)
-        // If a named return has the same name as a parameter, tag it as parameter
-        // Otherwise tag it as variable (it's like a local)
+        // Always tag these as parameter + declaration + output
         if (func.returnType && 'params' in func.returnType) {
-            const paramNames = new Set(func.params.map(p => p.name));
             const namedReturn = func.returnType;
             for (const ret of namedReturn.params) {
-                if (ret.span) {
-                    // The span includes the type annotation, we need just the name
-                    const retText = text.slice(ret.span.start, ret.span.end);
-                    const colonIdx = retText.indexOf(':');
-                    if (colonIdx > 0) {
-                        const nameEnd = ret.span.start + colonIdx;
-                        // If same name as param, tag as parameter; otherwise as variable
-                        const tokenType = paramNames.has(ret.name) ? 0 : 1;
-                        addToken({ start: ret.span.start, end: nameEnd }, tokenType, 1); // + declaration
-                    }
+                // The span covers "name: type", extract just the name part
+                const retText = text.slice(ret.span.start, ret.span.end);
+                const colonIdx = retText.indexOf(':');
+                if (colonIdx > 0) {
+                    const nameEnd = ret.span.start + colonIdx;
+                    addToken({ start: ret.span.start, end: nameEnd }, 0, 1 | 16); // parameter + declaration + output
                 }
             }
         }
@@ -513,17 +519,17 @@ connection.languages.semanticTokens.on((params) => {
         if (func.body) {
             if (func.body.kind === 'ArrowBody') {
                 for (const expr of func.body.exprs) {
-                    processExpr(expr, localSymbols);
+                    processExpr(expr, localSymbols, namedReturnNames);
                 }
             }
             else {
                 for (const stmt of func.body.stmts) {
-                    processStmt(stmt, localSymbols);
+                    processStmt(stmt, localSymbols, namedReturnNames);
                 }
             }
         }
     }
-    function processStmt(stmt, localSymbols) {
+    function processStmt(stmt, localSymbols, namedReturnNames) {
         switch (stmt.kind) {
             case 'LocalDecl': {
                 // Tag the local variable name
@@ -535,7 +541,7 @@ connection.languages.semanticTokens.on((params) => {
                     addToken({ start: nameStart, end: nameEnd }, 1, 1); // variable + declaration
                 }
                 if (stmt.init) {
-                    processExpr(stmt.init, localSymbols);
+                    processExpr(stmt.init, localSymbols, namedReturnNames);
                 }
                 break;
             }
@@ -543,103 +549,116 @@ connection.languages.semanticTokens.on((params) => {
                 // Assignment targets are Identifier nodes with spans
                 for (const target of stmt.targets) {
                     if (target.span) {
-                        const sym = localSymbols.get(target.name);
-                        const tokenType = sym?.kind === 'param' ? 0 : 1;
-                        addToken(target.span, tokenType, 4); // modification modifier (bit 2)
+                        // Named returns are parameter + output modifier, regular params just parameter
+                        if (namedReturnNames.has(target.name)) {
+                            addToken(target.span, 0, 4 | 16); // parameter + modification + output
+                        }
+                        else if (localSymbols.get(target.name)?.kind === 'param') {
+                            addToken(target.span, 0, 4); // parameter + modification
+                        }
+                        else {
+                            addToken(target.span, 1, 4); // variable + modification
+                        }
                     }
                 }
-                processExpr(stmt.value, localSymbols);
+                processExpr(stmt.value, localSymbols, namedReturnNames);
                 break;
             case 'ExprStmt':
-                processExpr(stmt.expr, localSymbols);
+                processExpr(stmt.expr, localSymbols, namedReturnNames);
                 break;
             case 'ReturnStmt':
                 if (stmt.value) {
-                    processExpr(stmt.value, localSymbols);
+                    processExpr(stmt.value, localSymbols, namedReturnNames);
                 }
                 break;
             case 'IfStmt':
-                processExpr(stmt.condition, localSymbols);
+                processExpr(stmt.condition, localSymbols, namedReturnNames);
                 for (const s of stmt.thenBody) {
-                    processStmt(s, localSymbols);
+                    processStmt(s, localSymbols, namedReturnNames);
                 }
                 if (stmt.elseBody) {
                     for (const s of stmt.elseBody) {
-                        processStmt(s, localSymbols);
+                        processStmt(s, localSymbols, namedReturnNames);
                     }
                 }
                 break;
             case 'WhileStmt':
-                processExpr(stmt.condition, localSymbols);
+                processExpr(stmt.condition, localSymbols, namedReturnNames);
                 for (const s of stmt.body) {
-                    processStmt(s, localSymbols);
+                    processStmt(s, localSymbols, namedReturnNames);
                 }
                 break;
             case 'LoopStmt':
                 for (const s of stmt.body) {
-                    processStmt(s, localSymbols);
+                    processStmt(s, localSymbols, namedReturnNames);
                 }
                 break;
             case 'ForStmt':
-                processExpr(stmt.iterable, localSymbols);
+                processExpr(stmt.iterable, localSymbols, namedReturnNames);
                 for (const s of stmt.body) {
-                    processStmt(s, localSymbols);
+                    processStmt(s, localSymbols, namedReturnNames);
                 }
                 break;
         }
     }
-    function processExpr(expr, localSymbols) {
+    function processExpr(expr, localSymbols, namedReturnNames) {
         switch (expr.kind) {
             case 'Identifier':
                 if (expr.span) {
-                    const sym = localSymbols.get(expr.name);
-                    if (sym) {
-                        // Local variable or parameter
-                        const tokenType = sym.kind === 'param' ? 0 : 1;
-                        addToken(expr.span, tokenType, 0);
+                    // Named returns are parameter + output modifier
+                    if (namedReturnNames.has(expr.name)) {
+                        addToken(expr.span, 0, 16); // parameter + output
                     }
                     else {
-                        // Check global scope
-                        const globalSym = symbols.global.symbols.get(expr.name);
-                        if (globalSym) {
-                            if (globalSym.kind === 'function' || globalSym.kind === 'builtin') {
-                                addToken(expr.span, 2, 0); // function
-                            }
-                            else {
-                                // Global variable: use 'variable' type with 'static' modifier
-                                addToken(expr.span, 1, 2); // variable + static (bit 1)
+                        const sym = localSymbols.get(expr.name);
+                        if (sym) {
+                            // Local variable or parameter
+                            const tokenType = sym.kind === 'param' ? 0 : 1;
+                            addToken(expr.span, tokenType, 0);
+                        }
+                        else {
+                            // Check global scope
+                            const globalSym = symbols.global.symbols.get(expr.name);
+                            if (globalSym) {
+                                if (globalSym.kind === 'function' || globalSym.kind === 'builtin') {
+                                    addToken(expr.span, 2, 0); // function
+                                }
+                                else {
+                                    // Global variable: use 'variable' type with 'static' modifier
+                                    addToken(expr.span, 1, 2); // variable + static (bit 1)
+                                }
                             }
                         }
                     }
                 }
                 break;
             case 'BinaryExpr':
-                processExpr(expr.left, localSymbols);
-                processExpr(expr.right, localSymbols);
+                processExpr(expr.left, localSymbols, namedReturnNames);
+                processExpr(expr.right, localSymbols, namedReturnNames);
                 break;
             case 'UnaryExpr':
-                processExpr(expr.operand, localSymbols);
+                processExpr(expr.operand, localSymbols, namedReturnNames);
                 break;
             case 'CallExpr':
-                processExpr(expr.callee, localSymbols);
+                processExpr(expr.callee, localSymbols, namedReturnNames);
                 for (const arg of expr.args) {
-                    processExpr(arg, localSymbols);
+                    processExpr(arg, localSymbols, namedReturnNames);
                 }
                 break;
             case 'MemberExpr':
-                processExpr(expr.object, localSymbols);
+                processExpr(expr.object, localSymbols, namedReturnNames);
                 break;
             case 'IndexExpr':
-                processExpr(expr.object, localSymbols);
-                processExpr(expr.index, localSymbols);
+                processExpr(expr.object, localSymbols, namedReturnNames);
+                processExpr(expr.index, localSymbols, namedReturnNames);
                 break;
             case 'TupleExpr':
                 for (const elem of expr.elements) {
-                    processExpr(elem, localSymbols);
+                    processExpr(elem, localSymbols, namedReturnNames);
                 }
                 break;
             case 'CastExpr':
-                processExpr(expr.expr, localSymbols);
+                processExpr(expr.expr, localSymbols, namedReturnNames);
                 break;
         }
     }
