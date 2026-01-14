@@ -18,15 +18,19 @@ import {
   TextDocumentPositionParams,
   Hover,
   MarkupKind,
+  RenameParams,
+  WorkspaceEdit,
+  TextEdit,
+  PrepareRenameParams,
 } from 'vscode-languageserver/node';
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
-import { analyze, getLineAndColumn } from './compile';
-import type { CheckResult, Diagnostic, Type, Symbol as EncantisSymbol } from './types';
+import { analyze, getLineAndColumn, parse } from './compile';
+import type { CheckResult, Diagnostic, Type, Symbol as EncantisSymbol, Span, FuncDecl, Module } from './types';
 
-// Cache analysis results per document for hover support
-const analysisCache = new Map<string, { text: string; result: CheckResult }>();
+// Cache analysis results per document for hover and rename support
+const analysisCache = new Map<string, { text: string; result: CheckResult; ast: Module }>();
 
 // -----------------------------------------------------------------------------
 // Connection Setup
@@ -57,6 +61,10 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       // Enable hover
       hoverProvider: true,
+      // Enable rename
+      renameProvider: {
+        prepareProvider: true,
+      },
       // Future: Enable completions
       // completionProvider: {
       //   resolveProvider: true,
@@ -94,11 +102,12 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
   const text = textDocument.getText();
   const diagnostics: LSPDiagnostic[] = [];
 
-  // Run the Encantis analyzer
+  // Run the Encantis parser and analyzer
+  const parseResult = parse(text);
   const result = analyze(text);
 
-  // Cache the result for hover support
-  analysisCache.set(textDocument.uri, { text, result });
+  // Cache the result for hover and rename support
+  analysisCache.set(textDocument.uri, { text, result, ast: parseResult.ast });
 
   // Convert Encantis diagnostics to LSP diagnostics
   for (const diag of result.errors) {
@@ -280,6 +289,196 @@ function getWordAtOffset(text: string, offset: number): string | null {
 
 function isWordChar(ch: string): boolean {
   return /[a-zA-Z0-9_-]/.test(ch);
+}
+
+// -----------------------------------------------------------------------------
+// Rename Provider
+// -----------------------------------------------------------------------------
+
+connection.onPrepareRename((params: PrepareRenameParams): Range | null => {
+  const document = documents.get(params.textDocument.uri);
+  if (!document) return null;
+
+  const text = document.getText();
+  const offset = document.offsetAt(params.position);
+
+  // Get the word boundaries at the position
+  const wordRange = getWordRangeAtOffset(text, offset);
+  if (!wordRange) return null;
+
+  const word = text.slice(wordRange.start, wordRange.end);
+
+  // Check if it's a renameable symbol (not a keyword, builtin, or type)
+  const keywords = new Set([
+    'import', 'export', 'func', 'local', 'global', 'end',
+    'if', 'then', 'elif', 'else', 'while', 'do', 'for', 'in',
+    'loop', 'return', 'when', 'and', 'or', 'not', 'as',
+    'memory', 'define', 'interface', 'type', 'break', 'br', 'mut',
+  ]);
+
+  const builtins = new Set([
+    'sqrt', 'abs', 'ceil', 'floor', 'trunc', 'nearest', 'min', 'max', 'copysign',
+  ]);
+
+  const types = new Set([
+    'i32', 'u32', 'i64', 'u64', 'f32', 'f64', 'u8', 'i8', 'u16', 'i16',
+  ]);
+
+  if (keywords.has(word) || builtins.has(word) || types.has(word)) {
+    return null; // Cannot rename keywords, builtins, or types
+  }
+
+  // Check if this symbol exists in our analysis
+  const cached = analysisCache.get(params.textDocument.uri);
+  if (!cached) return null;
+
+  const symbol = findSymbol(cached.result, word);
+  if (!symbol) return null;
+
+  // Return the range of the word
+  const startPos = getLineAndColumn(text, wordRange.start);
+  const endPos = getLineAndColumn(text, wordRange.end);
+
+  return {
+    start: { line: startPos.line - 1, character: startPos.column - 1 },
+    end: { line: endPos.line - 1, character: endPos.column - 1 },
+  };
+});
+
+connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
+  const document = documents.get(params.textDocument.uri);
+  if (!document) return null;
+
+  const text = document.getText();
+  const offset = document.offsetAt(params.position);
+
+  // Get the word at the position
+  const word = getWordAtOffset(text, offset);
+  if (!word) return null;
+
+  // Find the symbol to determine its scope
+  const cached = analysisCache.get(params.textDocument.uri);
+  if (!cached) return null;
+
+  // Find which function contains the cursor (if any)
+  const containingFunc = findFunctionAtOffset(cached.ast, offset);
+
+  // Find the symbol and its scope
+  const symbolInfo = findSymbolWithScope(cached.result, word, containingFunc);
+  if (!symbolInfo) return null;
+
+  // Determine the rename boundaries based on symbol scope
+  let scopeStart = 0;
+  let scopeEnd = text.length;
+
+  if (symbolInfo.funcSpan) {
+    // Local/param symbol - only rename within this function
+    scopeStart = symbolInfo.funcSpan.start;
+    scopeEnd = symbolInfo.funcSpan.end;
+  }
+  // Global symbols rename everywhere (scopeStart/scopeEnd remain as full document)
+
+  // Find all occurrences of this identifier within the scope
+  const edits: TextEdit[] = [];
+  const regex = new RegExp(`\\b${escapeRegex(word)}\\b`, 'g');
+  const matches = text.matchAll(regex);
+
+  for (const match of matches) {
+    if (match.index === undefined) continue;
+    const matchStart = match.index;
+    const matchEnd = matchStart + word.length;
+
+    // Skip matches outside the scope
+    if (matchStart < scopeStart || matchEnd > scopeEnd) continue;
+
+    // Convert to LSP positions
+    const startPos = getLineAndColumn(text, matchStart);
+    const endPos = getLineAndColumn(text, matchEnd);
+
+    edits.push({
+      range: {
+        start: { line: startPos.line - 1, character: startPos.column - 1 },
+        end: { line: endPos.line - 1, character: endPos.column - 1 },
+      },
+      newText: params.newName,
+    });
+  }
+
+  if (edits.length === 0) return null;
+
+  return {
+    changes: {
+      [params.textDocument.uri]: edits,
+    },
+  };
+});
+
+function getWordRangeAtOffset(text: string, offset: number): { start: number; end: number } | null {
+  let start = offset;
+  let end = offset;
+
+  while (start > 0 && isWordChar(text[start - 1])) {
+    start--;
+  }
+  while (end < text.length && isWordChar(text[end])) {
+    end++;
+  }
+
+  if (start === end) return null;
+  return { start, end };
+}
+
+function findSymbolWithScope(
+  result: CheckResult,
+  name: string,
+  containingFunc: FuncDecl | undefined
+): { symbol: EncantisSymbol; isGlobal: boolean; funcSpan?: Span } | undefined {
+  // If we're inside a function, check that function's scope first
+  if (containingFunc) {
+    const funcScope = result.symbols.scopes.get(containingFunc);
+    if (funcScope) {
+      const sym = funcScope.symbols.get(name);
+      if (sym) {
+        return { symbol: sym, isGlobal: false, funcSpan: containingFunc.span };
+      }
+    }
+  }
+
+  // Check global scope
+  const globalSym = result.symbols.global.symbols.get(name);
+  if (globalSym) return { symbol: globalSym, isGlobal: true };
+
+  // Check all function scopes (fallback for edge cases)
+  for (const [func, scope] of result.symbols.scopes) {
+    const sym = scope.symbols.get(name);
+    if (sym) return { symbol: sym, isGlobal: false, funcSpan: func.span };
+  }
+
+  return undefined;
+}
+
+function findFunctionAtOffset(ast: Module, offset: number): FuncDecl | undefined {
+  // Check exported functions
+  for (const exp of ast.exports) {
+    if (exp.decl.kind === 'FuncDecl') {
+      if (offset >= exp.decl.span.start && offset <= exp.decl.span.end) {
+        return exp.decl;
+      }
+    }
+  }
+
+  // Check non-exported functions
+  for (const func of ast.functions) {
+    if (offset >= func.span.start && offset <= func.span.end) {
+      return func;
+    }
+  }
+
+  return undefined;
+}
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // -----------------------------------------------------------------------------
