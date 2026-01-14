@@ -64,6 +64,22 @@
           "meta.embedded.block.encantis": "encantis"
         }
       }
+    ],
+    "configurationDefaults": {
+      "[encantis]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "semanticTokenScopes": [
+      {
+        "language": "encantis",
+        "scopes": {
+          "parameter": ["variable.parameter.encantis"],
+          "variable": ["variable.other.local.encantis"],
+          "variable.static": ["variable.other.global.encantis"],
+          "function": ["entity.name.function.encantis"]
+        }
+      }
     ]
   }
 }

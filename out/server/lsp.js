@@ -17,6 +17,26 @@ const documents = new node_1.TextDocuments(vscode_languageserver_textdocument_1.
 let hasConfigurationCapability = false;
 let hasWorkspaceFolderCapability = false;
 // -----------------------------------------------------------------------------
+// Semantic Tokens Legend
+// -----------------------------------------------------------------------------
+// Token types - order matters, these are indices
+const tokenTypes = [
+    'parameter', // 0 - function parameters
+    'variable', // 1 - local variables and globals (distinguished by modifier)
+    'function', // 2 - function names
+];
+// Token modifiers - can be combined as bitflags
+const tokenModifiers = [
+    'declaration', // 0 (bit 0 = 1) - where the symbol is declared
+    'static', // 1 (bit 1 = 2) - global/static variables
+    'modification', // 2 (bit 2 = 4) - where a variable is being modified
+    'readonly', // 3 (bit 3 = 8) - immutable variables
+];
+const semanticTokensLegend = {
+    tokenTypes,
+    tokenModifiers,
+};
+// -----------------------------------------------------------------------------
 // Initialization
 // -----------------------------------------------------------------------------
 connection.onInitialize((params) => {
@@ -31,6 +51,11 @@ connection.onInitialize((params) => {
             // Enable rename
             renameProvider: {
                 prepareProvider: true,
+            },
+            // Enable semantic tokens for rich highlighting
+            semanticTokensProvider: {
+                legend: semanticTokensLegend,
+                full: true,
             },
             // Future: Enable completions
             // completionProvider: {
@@ -62,9 +87,9 @@ documents.onDidChangeContent(change => {
 async function validateTextDocument(textDocument) {
     const text = textDocument.getText();
     const diagnostics = [];
-    // Run the Encantis parser and analyzer
+    // Run the Encantis parser and checker (use same parseResult so FuncDecl refs match)
     const parseResult = (0, compile_1.parse)(text);
-    const result = (0, compile_1.analyze)(text);
+    const result = (0, compile_1.check)(parseResult, text);
     // Cache the result for hover and rename support
     analysisCache.set(textDocument.uri, { text, result, ast: parseResult.ast });
     // Convert Encantis diagnostics to LSP diagnostics
@@ -392,6 +417,244 @@ function findFunctionAtOffset(ast, offset) {
 function escapeRegex(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+// -----------------------------------------------------------------------------
+// Semantic Tokens Provider
+// -----------------------------------------------------------------------------
+connection.languages.semanticTokens.on((params) => {
+    const document = documents.get(params.textDocument.uri);
+    if (!document)
+        return { data: [] };
+    const cached = analysisCache.get(params.textDocument.uri);
+    if (!cached)
+        return { data: [] };
+    const text = document.getText();
+    const builder = new node_1.SemanticTokensBuilder();
+    const ast = cached.ast;
+    const symbols = cached.result.symbols;
+    // Collect all tokens to emit, sorted by position
+    const tokens = [];
+    // Helper to add a token
+    const addToken = (span, type, modifiers = 0) => {
+        tokens.push({ span, type, modifiers });
+    };
+    // Process global declarations
+    for (const global of ast.globals) {
+        // Find the name span within the global declaration
+        // Format: "global name = value" or "global name: type = value"
+        const declText = text.slice(global.span.start, global.span.end);
+        const match = declText.match(/^global\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
+        if (match) {
+            const nameStart = global.span.start + declText.indexOf(match[1]);
+            const nameEnd = nameStart + match[1].length;
+            addToken({ start: nameStart, end: nameEnd }, 1, 2 | 1); // variable + static + declaration
+        }
+    }
+    // Process exports and their function declarations
+    for (const exp of ast.exports) {
+        if (exp.decl.kind === 'FuncDecl') {
+            processFunction(exp.decl);
+        }
+    }
+    // Process non-exported functions
+    for (const func of ast.functions) {
+        processFunction(func);
+    }
+    function processFunction(func) {
+        // Function name (if named)
+        if (func.name) {
+            const funcText = text.slice(func.span.start, func.span.end);
+            const nameMatch = funcText.match(/^func\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
+            if (nameMatch) {
+                const nameStart = func.span.start + funcText.indexOf(nameMatch[1]);
+                const nameEnd = nameStart + nameMatch[1].length;
+                addToken({ start: nameStart, end: nameEnd }, 2, 1); // function + declaration
+            }
+        }
+        // Parameters - use their spans from the AST
+        for (const param of func.params) {
+            if (param.span) {
+                // The param span includes the type annotation, we need just the name
+                const paramText = text.slice(param.span.start, param.span.end);
+                const colonIdx = paramText.indexOf(':');
+                if (colonIdx > 0) {
+                    const nameEnd = param.span.start + colonIdx;
+                    addToken({ start: param.span.start, end: nameEnd }, 0, 1); // parameter + declaration
+                }
+                else {
+                    // No type annotation, whole span is the name
+                    addToken(param.span, 0, 1); // parameter + declaration
+                }
+            }
+        }
+        // Named return values like -> (h64: u64)
+        // If a named return has the same name as a parameter, tag it as parameter
+        // Otherwise tag it as variable (it's like a local)
+        if (func.returnType && 'params' in func.returnType) {
+            const paramNames = new Set(func.params.map(p => p.name));
+            const namedReturn = func.returnType;
+            for (const ret of namedReturn.params) {
+                if (ret.span) {
+                    // The span includes the type annotation, we need just the name
+                    const retText = text.slice(ret.span.start, ret.span.end);
+                    const colonIdx = retText.indexOf(':');
+                    if (colonIdx > 0) {
+                        const nameEnd = ret.span.start + colonIdx;
+                        // If same name as param, tag as parameter; otherwise as variable
+                        const tokenType = paramNames.has(ret.name) ? 0 : 1;
+                        addToken({ start: ret.span.start, end: nameEnd }, tokenType, 1); // + declaration
+                    }
+                }
+            }
+        }
+        // Get function's scope to identify locals vs params
+        const funcScope = symbols.scopes.get(func);
+        const localSymbols = funcScope?.symbols || new Map();
+        // Process body - this is where identifiers live with accurate spans
+        if (func.body) {
+            if (func.body.kind === 'ArrowBody') {
+                for (const expr of func.body.exprs) {
+                    processExpr(expr, localSymbols);
+                }
+            }
+            else {
+                for (const stmt of func.body.stmts) {
+                    processStmt(stmt, localSymbols);
+                }
+            }
+        }
+    }
+    function processStmt(stmt, localSymbols) {
+        switch (stmt.kind) {
+            case 'LocalDecl': {
+                // Tag the local variable name
+                const localText = text.slice(stmt.span.start, stmt.span.end);
+                const localMatch = localText.match(/^local\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
+                if (localMatch) {
+                    const nameStart = stmt.span.start + localText.indexOf(localMatch[1]);
+                    const nameEnd = nameStart + localMatch[1].length;
+                    addToken({ start: nameStart, end: nameEnd }, 1, 1); // variable + declaration
+                }
+                if (stmt.init) {
+                    processExpr(stmt.init, localSymbols);
+                }
+                break;
+            }
+            case 'Assignment':
+                // Assignment targets are Identifier nodes with spans
+                for (const target of stmt.targets) {
+                    if (target.span) {
+                        const sym = localSymbols.get(target.name);
+                        const tokenType = sym?.kind === 'param' ? 0 : 1;
+                        addToken(target.span, tokenType, 4); // modification modifier (bit 2)
+                    }
+                }
+                processExpr(stmt.value, localSymbols);
+                break;
+            case 'ExprStmt':
+                processExpr(stmt.expr, localSymbols);
+                break;
+            case 'ReturnStmt':
+                if (stmt.value) {
+                    processExpr(stmt.value, localSymbols);
+                }
+                break;
+            case 'IfStmt':
+                processExpr(stmt.condition, localSymbols);
+                for (const s of stmt.thenBody) {
+                    processStmt(s, localSymbols);
+                }
+                if (stmt.elseBody) {
+                    for (const s of stmt.elseBody) {
+                        processStmt(s, localSymbols);
+                    }
+                }
+                break;
+            case 'WhileStmt':
+                processExpr(stmt.condition, localSymbols);
+                for (const s of stmt.body) {
+                    processStmt(s, localSymbols);
+                }
+                break;
+            case 'LoopStmt':
+                for (const s of stmt.body) {
+                    processStmt(s, localSymbols);
+                }
+                break;
+            case 'ForStmt':
+                processExpr(stmt.iterable, localSymbols);
+                for (const s of stmt.body) {
+                    processStmt(s, localSymbols);
+                }
+                break;
+        }
+    }
+    function processExpr(expr, localSymbols) {
+        switch (expr.kind) {
+            case 'Identifier':
+                if (expr.span) {
+                    const sym = localSymbols.get(expr.name);
+                    if (sym) {
+                        // Local variable or parameter
+                        const tokenType = sym.kind === 'param' ? 0 : 1;
+                        addToken(expr.span, tokenType, 0);
+                    }
+                    else {
+                        // Check global scope
+                        const globalSym = symbols.global.symbols.get(expr.name);
+                        if (globalSym) {
+                            if (globalSym.kind === 'function' || globalSym.kind === 'builtin') {
+                                addToken(expr.span, 2, 0); // function
+                            }
+                            else {
+                                // Global variable: use 'variable' type with 'static' modifier
+                                addToken(expr.span, 1, 2); // variable + static (bit 1)
+                            }
+                        }
+                    }
+                }
+                break;
+            case 'BinaryExpr':
+                processExpr(expr.left, localSymbols);
+                processExpr(expr.right, localSymbols);
+                break;
+            case 'UnaryExpr':
+                processExpr(expr.operand, localSymbols);
+                break;
+            case 'CallExpr':
+                processExpr(expr.callee, localSymbols);
+                for (const arg of expr.args) {
+                    processExpr(arg, localSymbols);
+                }
+                break;
+            case 'MemberExpr':
+                processExpr(expr.object, localSymbols);
+                break;
+            case 'IndexExpr':
+                processExpr(expr.object, localSymbols);
+                processExpr(expr.index, localSymbols);
+                break;
+            case 'TupleExpr':
+                for (const elem of expr.elements) {
+                    processExpr(elem, localSymbols);
+                }
+                break;
+            case 'CastExpr':
+                processExpr(expr.expr, localSymbols);
+                break;
+        }
+    }
+    // Sort tokens by position (required by LSP)
+    tokens.sort((a, b) => a.span.start - b.span.start);
+    // Emit tokens using the builder
+    for (const token of tokens) {
+        const startPos = (0, compile_1.getLineAndColumn)(text, token.span.start);
+        const length = token.span.end - token.span.start;
+        builder.push(startPos.line - 1, // 0-based line
+        startPos.column - 1, // 0-based character
+        length, token.type, token.modifiers);
+    }
+    return builder.build();
+});
 // -----------------------------------------------------------------------------
 // Document Events
 // -----------------------------------------------------------------------------
