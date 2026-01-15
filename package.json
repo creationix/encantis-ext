@@ -12,6 +12,7 @@
   "categories": [
     "Programming Languages"
   ],
+  "activationEvents": [],
   "main": "./out/extension.js",
   "scripts": {
     "vscode:prepublish": "npm run compile",

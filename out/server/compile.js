@@ -110,9 +110,17 @@ function inferExprType(ctx, expr) {
                 return { kind: 'PrimitiveType', name: 'f64', span: expr.span };
             }
             return { kind: 'PrimitiveType', name: 'i32', span: expr.span };
-        case 'BinaryExpr':
-            // Result type matches left operand type
-            return inferExprType(ctx, expr.left);
+        case 'BinaryExpr': {
+            // Result type is the promoted type of both operands
+            const leftType = inferExprType(ctx, expr.left);
+            const rightType = inferExprType(ctx, expr.right);
+            const leftWat = getWatPrefix(leftType);
+            const rightWat = getWatPrefix(rightType);
+            // Use whichever is wider in the type hierarchy
+            const resultWat = typeRank[leftWat] >= typeRank[rightWat]
+                ? leftWat : rightWat;
+            return { kind: 'PrimitiveType', name: resultWat, span: expr.span };
+        }
         case 'CallExpr': {
             if (expr.callee.kind === 'Identifier') {
                 const sym = ctx.symbols.global.symbols.get(expr.callee.name);
@@ -145,6 +153,175 @@ function getWatPrefix(type) {
         case 'u64': return 'i64';
         default: return 'i32'; // i32, u32, i16, u16, i8, u8
     }
+}
+/**
+ * Check if a type is unsigned (for choosing signed vs unsigned conversions).
+ */
+function isUnsignedType(type) {
+    if (!type || type.kind !== 'PrimitiveType')
+        return false;
+    return type.name.startsWith('u');
+}
+/**
+ * Check if converting an integer type to a float type is lossless.
+ * - f32 has 24-bit mantissa: safe for i8, u8, i16, u16
+ * - f64 has 53-bit mantissa: safe for i8, u8, i16, u16, i32, u32
+ */
+function isLosslessIntToFloat(intType, floatWat) {
+    if (!intType || intType.kind !== 'PrimitiveType')
+        return false;
+    const smallInts = ['i8', 'u8', 'i16', 'u16'];
+    const mediumInts = ['i32', 'u32'];
+    if (floatWat === 'f64') {
+        // f64 can safely hold i8, u8, i16, u16, i32, u32
+        return smallInts.includes(intType.name) || mediumInts.includes(intType.name);
+    }
+    else if (floatWat === 'f32') {
+        // f32 can only safely hold i8, u8, i16, u16
+        return smallInts.includes(intType.name);
+    }
+    return false;
+}
+/**
+ * Check if a comptime (untyped) integer literal can be losslessly converted to float.
+ * Since we know the exact value, we can check if it fits in the mantissa.
+ * - f32: 24-bit mantissa → exact integers in [-2^24, 2^24]
+ * - f64: 53-bit mantissa → exact integers in [-2^53, 2^53]
+ */
+function isComptimeLiteralSafeForFloat(expr, floatWat) {
+    if (expr.kind !== 'NumberLiteral')
+        return false;
+    // If it has a suffix, it's not a comptime/untyped literal
+    if (expr.suffix)
+        return false;
+    // If it's already a float literal, no int→float conversion needed
+    if (expr.value.includes('.') || expr.value.includes('e') || expr.value.includes('E'))
+        return false;
+    const value = parseInt(expr.value, 10);
+    if (Number.isNaN(value))
+        return false;
+    // Check if the integer value fits exactly in the float's mantissa
+    if (floatWat === 'f32') {
+        // f32 has 24-bit mantissa: [-16777216, 16777216]
+        const MAX_SAFE_F32 = 2 ** 24;
+        return value >= -MAX_SAFE_F32 && value <= MAX_SAFE_F32;
+    }
+    else if (floatWat === 'f64') {
+        // f64 has 53-bit mantissa: [-9007199254740992, 9007199254740992]
+        const MAX_SAFE_F64 = 2 ** 53;
+        return value >= -MAX_SAFE_F64 && value <= MAX_SAFE_F64;
+    }
+    return false;
+}
+/**
+ * Type promotion hierarchy: i32 < i64 < f32 < f64
+ * Implicit promotion always goes to the wider type.
+ */
+const typeRank = {
+    'i32': 0,
+    'i64': 1,
+    'f32': 2,
+    'f64': 3,
+};
+/**
+ * Conversion instructions from one type to another.
+ * Key format: "fromType_toType_signed" where signed is 's' or 'u'
+ */
+function getConversion(from, to, unsigned) {
+    const suffix = unsigned ? 'u' : 's';
+    const conversionMap = {
+        // i32 → wider types
+        'i32_i64': `i64.extend_i32_${suffix}`,
+        'i32_f32': `f32.convert_i32_${suffix}`,
+        'i32_f64': `f64.convert_i32_${suffix}`,
+        // i64 → float types
+        'i64_f32': `f32.convert_i64_${suffix}`,
+        'i64_f64': `f64.convert_i64_${suffix}`,
+        // f32 → f64
+        'f32_f64': 'f64.promote_f32',
+    };
+    return conversionMap[`${from}_${to}`];
+}
+/**
+ * Resolve binary operation with type promotion.
+ * Returns the operation info including any needed conversions, or undefined if types are incompatible.
+ * Optionally accepts expressions to check comptime literals for more precise conversion checks.
+ */
+function resolveBinaryOp(op, leftType, rightType, leftExpr, rightExpr) {
+    const leftWat = getWatPrefix(leftType);
+    const rightWat = getWatPrefix(rightType);
+    const leftUnsigned = isUnsignedType(leftType);
+    const rightUnsigned = isUnsignedType(rightType);
+    // Determine result type (promote to wider)
+    let resultType;
+    let convertLeft;
+    let convertRight;
+    const leftIsInt = leftWat === 'i32' || leftWat === 'i64';
+    const rightIsInt = rightWat === 'i32' || rightWat === 'i64';
+    const leftIsFloat = leftWat === 'f32' || leftWat === 'f64';
+    const rightIsFloat = rightWat === 'f32' || rightWat === 'f64';
+    if (leftWat === rightWat) {
+        // Same type, no conversion needed
+        resultType = leftWat;
+    }
+    else if (typeRank[leftWat] > typeRank[rightWat]) {
+        // Left is wider, promote right
+        resultType = leftWat;
+        // Check for lossy int→float conversion (allow comptime literals if value fits)
+        if (rightIsInt && leftIsFloat) {
+            const isComptimeSafe = rightExpr && isComptimeLiteralSafeForFloat(rightExpr, leftWat);
+            if (!isComptimeSafe && !isLosslessIntToFloat(rightType, leftWat)) {
+                return undefined; // Precision loss: require explicit cast
+            }
+        }
+        convertRight = getConversion(rightWat, leftWat, rightUnsigned);
+        if (!convertRight)
+            return undefined; // Incompatible types
+    }
+    else {
+        // Right is wider, promote left
+        resultType = rightWat;
+        // Check for lossy int→float conversion (allow comptime literals if value fits)
+        if (leftIsInt && rightIsFloat) {
+            const isComptimeSafe = leftExpr && isComptimeLiteralSafeForFloat(leftExpr, rightWat);
+            if (!isComptimeSafe && !isLosslessIntToFloat(leftType, rightWat)) {
+                return undefined; // Precision loss: require explicit cast
+            }
+        }
+        convertLeft = getConversion(leftWat, rightWat, leftUnsigned);
+        if (!convertLeft)
+            return undefined; // Incompatible types
+    }
+    const isFloat = resultType === 'f64' || resultType === 'f32';
+    // Build the operation string
+    const opMap = {
+        '+': `${resultType}.add`,
+        '-': `${resultType}.sub`,
+        '*': `${resultType}.mul`,
+        '/': isFloat ? `${resultType}.div` : `${resultType}.div_s`,
+        '%': `${resultType}.rem_s`, // integers only
+        '&': `${resultType}.and`, // integers only
+        '|': `${resultType}.or`, // integers only
+        '^': `${resultType}.xor`, // integers only
+        '<<': `${resultType}.shl`, // integers only
+        '>>': `${resultType}.shr_s`, // integers only
+        '<<<': `${resultType}.rotl`, // integers only
+        '>>>': `${resultType}.rotr`, // integers only
+        '<': isFloat ? `${resultType}.lt` : `${resultType}.lt_s`,
+        '>': isFloat ? `${resultType}.gt` : `${resultType}.gt_s`,
+        '<=': isFloat ? `${resultType}.le` : `${resultType}.le_s`,
+        '>=': isFloat ? `${resultType}.ge` : `${resultType}.ge_s`,
+        '==': `${resultType}.eq`,
+        '!=': `${resultType}.ne`,
+    };
+    const watOp = opMap[op];
+    if (!watOp)
+        return undefined;
+    // Validate: bitwise/rem ops don't work on floats
+    if (isFloat && ['%', '&', '|', '^', '<<', '>>', '<<<', '>>>'].includes(op)) {
+        return undefined; // Type error: bitwise ops on floats
+    }
+    return { resultType, convertLeft, convertRight, op: watOp };
 }
 function generateGlobalInit(expr) {
     // For global initialization, we need a constant expression
@@ -385,10 +562,25 @@ function generateExpr(ctx, expr) {
             }
             break;
         case 'BinaryExpr': {
-            const exprType = inferExprType(ctx, expr);
+            const leftType = inferExprType(ctx, expr.left);
+            const rightType = inferExprType(ctx, expr.right);
+            const opResult = resolveBinaryOp(expr.op, leftType, rightType, expr.left, expr.right);
+            if (!opResult) {
+                // Type error - incompatible types for this operation
+                emit(ctx, `;; ERROR: incompatible types for ${expr.op}`);
+                break;
+            }
+            // Generate left operand, then convert if needed
             generateExpr(ctx, expr.left);
+            if (opResult.convertLeft) {
+                emit(ctx, `(${opResult.convertLeft})`);
+            }
+            // Generate right operand, then convert if needed
             generateExpr(ctx, expr.right);
-            emit(ctx, `(${getBinaryOp(expr.op, exprType)})`);
+            if (opResult.convertRight) {
+                emit(ctx, `(${opResult.convertRight})`);
+            }
+            emit(ctx, `(${opResult.op})`);
             break;
         }
         case 'CallExpr': {
@@ -426,33 +618,6 @@ function generateExpr(ctx, expr) {
         default:
             emit(ctx, `;; TODO: ${expr.kind}`);
     }
-}
-function getBinaryOp(op, type) {
-    const prefix = getWatPrefix(type);
-    const isFloat = prefix === 'f64' || prefix === 'f32';
-    // Float types don't have bitwise ops, rem, or rotate
-    // Comparison ops use different suffixes for float vs int
-    const opMap = {
-        '+': `${prefix}.add`,
-        '-': `${prefix}.sub`,
-        '*': `${prefix}.mul`,
-        '/': isFloat ? `${prefix}.div` : `${prefix}.div_s`,
-        '%': `${prefix}.rem_s`, // integers only
-        '&': `${prefix}.and`, // integers only
-        '|': `${prefix}.or`, // integers only
-        '^': `${prefix}.xor`, // integers only
-        '<<': `${prefix}.shl`, // integers only
-        '>>': `${prefix}.shr_s`, // integers only
-        '<<<': `${prefix}.rotl`, // integers only
-        '>>>': `${prefix}.rotr`, // integers only
-        '<': isFloat ? `${prefix}.lt` : `${prefix}.lt_s`,
-        '>': isFloat ? `${prefix}.gt` : `${prefix}.gt_s`,
-        '<=': isFloat ? `${prefix}.le` : `${prefix}.le_s`,
-        '>=': isFloat ? `${prefix}.ge` : `${prefix}.ge_s`,
-        '==': `${prefix}.eq`,
-        '!=': `${prefix}.ne`,
-    };
-    return opMap[op] || `${prefix}.${op}`;
 }
 function typeToWat(type) {
     switch (type.kind) {
