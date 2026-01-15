@@ -165,6 +165,27 @@
                     "match": "(?<=[a-zA-Z0-9_-])\\.[0-9]+"
                 },
                 {
+                    "name": "punctuation.accessor.typepun.encantis",
+                    "match": "(?<=[a-zA-Z0-9_*\\]])\\.(u8|i8|u16|i16|u32|i32|u64|i64|f32|f64|bool)(?![a-zA-Z0-9_-])",
+                    "captures": {
+                        "1": { "name": "entity.name.type.encantis" }
+                    }
+                },
+                {
+                    "name": "punctuation.accessor.typepun.user.encantis",
+                    "match": "(?<=[a-zA-Z0-9_*\\]])\\.[A-Z][0-9A-Za-z_-]*",
+                    "captures": {
+                        "0": { "name": "support.type.encantis" }
+                    }
+                },
+                {
+                    "name": "punctuation.accessor.method.encantis",
+                    "match": "(?<=[a-zA-Z0-9_*\\]))])\\.([a-z][0-9A-Za-z_-]*)(?=\\()",
+                    "captures": {
+                        "1": { "name": "entity.name.function.encantis" }
+                    }
+                },
+                {
                     "name": "punctuation.accessor.property.encantis",
                     "match": "(?<=[a-zA-Z0-9_-])\\.[a-z][0-9A-Za-z_-]*"
                 },

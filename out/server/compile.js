@@ -9,6 +9,7 @@ exports.parse = parse;
 exports.check = check;
 exports.analyze = analyze;
 exports.compile = compile;
+exports.compileWithSourceMap = compileWithSourceMap;
 const checker_1 = require("./checker");
 const lexer_1 = require("./lexer");
 Object.defineProperty(exports, "formatDiagnostic", { enumerable: true, get: function () { return lexer_1.formatDiagnostic; } });
@@ -53,29 +54,121 @@ function analyze(src) {
  * Currently a placeholder - full codegen will be added later.
  */
 function compile(src) {
+    const result = compileWithSourceMap(src);
+    return result.wat;
+}
+/**
+ * Compile Encantis source code to WAT with source mapping.
+ * Used by the WAT preview feature for click-to-navigate.
+ */
+function compileWithSourceMap(src) {
     const parseResult = parse(src);
     const checkResult = check(parseResult, src);
     if (checkResult.errors.some(e => e.severity === 'error')) {
-        // Return error summary instead of WAT
+        // Return error summary as WAT comment with no source map
         const errorLines = checkResult.errors
             .filter(e => e.severity === 'error')
-            .map(e => (0, lexer_1.formatDiagnostic)(src, e));
-        throw new Error(`Compilation failed with ${errorLines.length} error(s):\n\n${errorLines.join('\n\n')}`);
+            .map(e => `;; ERROR: ${(0, lexer_1.formatDiagnostic)(src, e).replace(/\n/g, '\n;; ')}`);
+        return {
+            wat: `;; Compilation failed\n${errorLines.join('\n')}`,
+            sourceMap: [],
+        };
     }
-    // TODO: Implement code generation
-    return generateWat(parseResult.ast, src);
+    return generateWatWithSourceMap(parseResult.ast, checkResult.symbols, src);
 }
 function emit(ctx, line) {
     ctx.output.push('  '.repeat(ctx.indent) + line);
 }
-function generateWat(module, src) {
+function emitWithSpan(ctx, line, span) {
+    const watLine = ctx.output.length;
+    ctx.output.push('  '.repeat(ctx.indent) + line);
+    if (span) {
+        ctx.sourceMap.push({ watLine, sourceSpan: span });
+    }
+}
+// -----------------------------------------------------------------------------
+// Type Inference Helpers
+// -----------------------------------------------------------------------------
+/**
+ * Infer the type of an expression using the symbol table.
+ */
+function inferExprType(ctx, expr) {
+    switch (expr.kind) {
+        case 'Identifier': {
+            // Look up in current function scope first, then global
+            const funcScope = ctx.currentFunc ? ctx.symbols.scopes.get(ctx.currentFunc) : undefined;
+            let sym = funcScope?.symbols.get(expr.name);
+            if (!sym)
+                sym = ctx.symbols.global.symbols.get(expr.name);
+            return sym?.type;
+        }
+        case 'NumberLiteral':
+            if (expr.suffix) {
+                return { kind: 'PrimitiveType', name: expr.suffix, span: expr.span };
+            }
+            if (expr.value.includes('.') || expr.value.includes('e') || expr.value.includes('E')) {
+                return { kind: 'PrimitiveType', name: 'f64', span: expr.span };
+            }
+            return { kind: 'PrimitiveType', name: 'i32', span: expr.span };
+        case 'BinaryExpr':
+            // Result type matches left operand type
+            return inferExprType(ctx, expr.left);
+        case 'CallExpr': {
+            if (expr.callee.kind === 'Identifier') {
+                const sym = ctx.symbols.global.symbols.get(expr.callee.name);
+                if (sym?.type?.kind === 'FunctionType') {
+                    return sym.type.returns;
+                }
+            }
+            return undefined;
+        }
+        case 'TupleExpr':
+            return {
+                kind: 'TupleType',
+                elements: expr.elements.map(e => inferExprType(ctx, e)).filter((t) => t !== undefined),
+                span: expr.span,
+            };
+        default:
+            return undefined;
+    }
+}
+/**
+ * Get the WAT type prefix (i32, i64, f32, f64) for a given type.
+ */
+function getWatPrefix(type) {
+    if (!type || type.kind !== 'PrimitiveType')
+        return 'i32';
+    switch (type.name) {
+        case 'f64': return 'f64';
+        case 'f32': return 'f32';
+        case 'i64':
+        case 'u64': return 'i64';
+        default: return 'i32'; // i32, u32, i16, u16, i8, u8
+    }
+}
+function generateGlobalInit(expr) {
+    // For global initialization, we need a constant expression
+    if (expr.kind === 'NumberLiteral') {
+        return expr.value;
+    }
+    // TODO: handle other constant expressions
+    return '0';
+}
+function generateWatWithSourceMap(module, symbols, src) {
     const ctx = {
         output: [],
         indent: 0,
         strings: new Map(),
         stringOffset: 0,
         src,
+        sourceMap: [],
+        globals: new Set(),
+        symbols,
     };
+    // Collect global names first
+    for (const global of module.globals) {
+        ctx.globals.add(global.name);
+    }
     emit(ctx, '(module');
     ctx.indent++;
     // Generate imports
@@ -85,7 +178,7 @@ function generateWat(module, src) {
                 const localName = item.localName || item.exportName;
                 const params = item.params.map(p => `(param ${typeToWat(p.type)})`).join(' ');
                 const result = item.returnType ? `(result ${typeToWat(item.returnType)})` : '';
-                emit(ctx, `(func $${localName} (import "${imp.module}" "${item.exportName}") ${params} ${result})`);
+                emitWithSpan(ctx, `(func $${localName} (import "${imp.module}" "${item.exportName}") ${params} ${result})`, imp.span);
             }
         }
         else {
@@ -96,8 +189,15 @@ function generateWat(module, src) {
             const result = returns.kind !== 'TupleType' || (returns.kind === 'TupleType' && returns.elements.length > 0)
                 ? `(result ${typeToWat(imp.funcType.returns)})`
                 : '';
-            emit(ctx, `(func $${localName} (import "${imp.module}" "${imp.exportName}") ${paramsStr} ${result})`);
+            emitWithSpan(ctx, `(func $${localName} (import "${imp.module}" "${imp.exportName}") ${paramsStr} ${result})`, imp.span);
         }
+    }
+    // Generate globals
+    for (const global of module.globals) {
+        const watType = global.type ? typeToWat(global.type) : 'i32';
+        const mutability = global.mutable ? `(mut ${watType})` : watType;
+        const initValue = generateGlobalInit(global.init);
+        emit(ctx, `(global $${global.name} ${mutability} (${watType}.const ${initValue}))`);
     }
     // Generate exports
     for (const exp of module.exports) {
@@ -105,7 +205,7 @@ function generateWat(module, src) {
             generateFunction(ctx, exp.decl, exp.exportName);
         }
         else if (exp.decl.kind === 'MemoryDecl') {
-            emit(ctx, `(memory (export "${exp.exportName}") ${exp.decl.pages})`);
+            emitWithSpan(ctx, `(memory (export "${exp.exportName}") ${exp.decl.pages})`, exp.decl.span);
         }
     }
     // Generate non-exported functions
@@ -127,9 +227,13 @@ function generateWat(module, src) {
     }
     ctx.indent--;
     emit(ctx, ')');
-    return ctx.output.join('\n');
+    return {
+        wat: ctx.output.join('\n'),
+        sourceMap: ctx.sourceMap,
+    };
 }
 function generateFunction(ctx, func, exportName) {
+    ctx.currentFunc = func; // Set for type lookups in this function's scope
     const name = func.name || exportName || 'anonymous';
     const exportClause = exportName ? `(export "${exportName}")` : '';
     // Build params
@@ -146,7 +250,7 @@ function generateFunction(ctx, func, exportName) {
             results = `(result ${typeToWat(func.returnType)})`;
         }
     }
-    emit(ctx, `(func $${name} ${exportClause} ${params} ${results}`.trim());
+    emitWithSpan(ctx, `(func $${name} ${exportClause} ${params} ${results}`.trim(), func.span);
     ctx.indent++;
     // Collect locals from body
     if (func.body?.kind === 'BlockBody') {
@@ -169,6 +273,7 @@ function generateFunction(ctx, func, exportName) {
     }
     ctx.indent--;
     emit(ctx, ')');
+    ctx.currentFunc = undefined; // Clear after function generation
 }
 function generateFuncBody(ctx, body, func) {
     if (body.kind === 'ArrowBody') {
@@ -200,10 +305,44 @@ function generateStmt(ctx, stmt) {
             }
             break;
         case 'Assignment':
-            generateExpr(ctx, stmt.value);
-            // For multiple targets, WAT pops in reverse order
-            for (let i = stmt.targets.length - 1; i >= 0; i--) {
-                emit(ctx, `(local.set $${stmt.targets[i].name})`);
+            if (stmt.op) {
+                // Compound assignment: target op= value  ->  target = target op value
+                // Only works for single target
+                const target = stmt.targets[0];
+                const isGlobal = ctx.globals.has(target.name);
+                const targetType = inferExprType(ctx, target);
+                const prefix = getWatPrefix(targetType);
+                const isFloat = prefix === 'f64' || prefix === 'f32';
+                emit(ctx, `(${isGlobal ? 'global' : 'local'}.get $${target.name})`);
+                generateExpr(ctx, stmt.value);
+                // Map compound op to WAT instruction with correct type prefix
+                const opMap = {
+                    '+=': `${prefix}.add`,
+                    '-=': `${prefix}.sub`,
+                    '*=': `${prefix}.mul`,
+                    '/=': isFloat ? `${prefix}.div` : `${prefix}.div_s`,
+                    '%=': `${prefix}.rem_s`, // integers only
+                    '&=': `${prefix}.and`, // integers only
+                    '|=': `${prefix}.or`, // integers only
+                    '^=': `${prefix}.xor`, // integers only
+                    '<<=': `${prefix}.shl`, // integers only
+                    '>>=': `${prefix}.shr_s`, // integers only
+                    '<<<=': `${prefix}.rotl`, // integers only
+                    '>>>=': `${prefix}.rotr`, // integers only
+                };
+                const watOp = opMap[stmt.op] || `${prefix}.add`;
+                emit(ctx, `(${watOp})`);
+                emit(ctx, `(${isGlobal ? 'global' : 'local'}.set $${target.name})`);
+            }
+            else {
+                // Simple assignment
+                generateExpr(ctx, stmt.value);
+                // For multiple targets, WAT pops in reverse order
+                for (let i = stmt.targets.length - 1; i >= 0; i--) {
+                    const t = stmt.targets[i];
+                    const isGlobal = ctx.globals.has(t.name);
+                    emit(ctx, `(${isGlobal ? 'global' : 'local'}.set $${t.name})`);
+                }
             }
             break;
         case 'ExprStmt':
@@ -225,13 +364,9 @@ function generateStmt(ctx, stmt) {
 function generateExpr(ctx, expr) {
     switch (expr.kind) {
         case 'NumberLiteral': {
-            const isFloat = expr.value.includes('.') || expr.suffix === 'f32' || expr.suffix === 'f64';
-            if (isFloat) {
-                emit(ctx, `(f64.const ${expr.value})`);
-            }
-            else {
-                emit(ctx, `(i32.const ${expr.value})`);
-            }
+            const literalType = inferExprType(ctx, expr);
+            const prefix = getWatPrefix(literalType);
+            emit(ctx, `(${prefix}.const ${expr.value})`);
             break;
         }
         case 'StringLiteral': {
@@ -242,13 +377,20 @@ function generateExpr(ctx, expr) {
             break;
         }
         case 'Identifier':
-            emit(ctx, `(local.get $${expr.name})`);
+            if (ctx.globals.has(expr.name)) {
+                emit(ctx, `(global.get $${expr.name})`);
+            }
+            else {
+                emit(ctx, `(local.get $${expr.name})`);
+            }
             break;
-        case 'BinaryExpr':
+        case 'BinaryExpr': {
+            const exprType = inferExprType(ctx, expr);
             generateExpr(ctx, expr.left);
             generateExpr(ctx, expr.right);
-            emit(ctx, `(${getBinaryOp(expr.op)})`);
+            emit(ctx, `(${getBinaryOp(expr.op, exprType)})`);
             break;
+        }
         case 'CallExpr': {
             // Check if this is a builtin function (WASM instruction)
             const builtinOps = {
@@ -285,15 +427,32 @@ function generateExpr(ctx, expr) {
             emit(ctx, `;; TODO: ${expr.kind}`);
     }
 }
-function getBinaryOp(op) {
-    // Default to f64 operations for MVP
+function getBinaryOp(op, type) {
+    const prefix = getWatPrefix(type);
+    const isFloat = prefix === 'f64' || prefix === 'f32';
+    // Float types don't have bitwise ops, rem, or rotate
+    // Comparison ops use different suffixes for float vs int
     const opMap = {
-        '+': 'f64.add',
-        '-': 'f64.sub',
-        '*': 'f64.mul',
-        '/': 'f64.div',
+        '+': `${prefix}.add`,
+        '-': `${prefix}.sub`,
+        '*': `${prefix}.mul`,
+        '/': isFloat ? `${prefix}.div` : `${prefix}.div_s`,
+        '%': `${prefix}.rem_s`, // integers only
+        '&': `${prefix}.and`, // integers only
+        '|': `${prefix}.or`, // integers only
+        '^': `${prefix}.xor`, // integers only
+        '<<': `${prefix}.shl`, // integers only
+        '>>': `${prefix}.shr_s`, // integers only
+        '<<<': `${prefix}.rotl`, // integers only
+        '>>>': `${prefix}.rotr`, // integers only
+        '<': isFloat ? `${prefix}.lt` : `${prefix}.lt_s`,
+        '>': isFloat ? `${prefix}.gt` : `${prefix}.gt_s`,
+        '<=': isFloat ? `${prefix}.le` : `${prefix}.le_s`,
+        '>=': isFloat ? `${prefix}.ge` : `${prefix}.ge_s`,
+        '==': `${prefix}.eq`,
+        '!=': `${prefix}.ne`,
     };
-    return opMap[op] || `f64.${op}`;
+    return opMap[op] || `${prefix}.${op}`;
 }
 function typeToWat(type) {
     switch (type.kind) {

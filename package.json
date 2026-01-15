@@ -30,6 +30,53 @@
     "typescript": "^5.0.0"
   },
   "contributes": {
+    "commands": [
+      {
+        "command": "encantis.openWatPreview",
+        "title": "Open WAT Preview",
+        "category": "Encantis",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "encantis.openWatPreviewSide",
+        "title": "Open WAT Preview to the Side",
+        "category": "Encantis",
+        "icon": "$(open-preview)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "encantis.openWatPreviewSide",
+          "when": "editorLangId == encantis",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "encantis.openWatPreview",
+          "when": "editorLangId == encantis"
+        },
+        {
+          "command": "encantis.openWatPreviewSide",
+          "when": "editorLangId == encantis"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "encantis.openWatPreview",
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v",
+        "when": "editorLangId == encantis"
+      },
+      {
+        "command": "encantis.openWatPreviewSide",
+        "key": "ctrl+k v",
+        "mac": "cmd+k v",
+        "when": "editorLangId == encantis"
+      }
+    ],
     "languages": [
       {
         "id": "encantis",
