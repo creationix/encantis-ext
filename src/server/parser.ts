@@ -5,11 +5,12 @@
 
 import {
   Token, TokenKind, Span, Diagnostic,
-  Type, PrimitiveType, SliceType, FixedArrayType, PointerType, TupleType, FunctionType,
+  Type, PrimitiveType, SliceType, FixedArrayType, NullTerminatedType, PointerType, TupleType, FunctionType,
+  StructType, StructField, NamedType, TypeAliasDecl,
   Expr, NumberLiteral, StringLiteral, Identifier, BinaryExpr, UnaryExpr,
-  CallExpr, IndexExpr, MemberExpr, CastExpr, TupleExpr, TernaryExpr, ErrorExpr,
-  Stmt, LocalDecl, Assignment, ExprStmt, ReturnStmt, IfStmt, WhileStmt,
-  ForStmt, LoopStmt, BreakStmt, BranchStmt, ErrorStmt,
+  CallExpr, IndexExpr, MemberExpr, CastExpr, TupleExpr, TernaryExpr, StructLiteral, StructLiteralField, ErrorExpr,
+  Stmt, LocalDecl, LetStmt, SetStmt, Assignment, ExprStmt, ReturnStmt, IfStmt, WhileStmt,
+  ForStmt, LoopStmt, BreakStmt, ContinueStmt, BranchStmt, ErrorStmt, PlaceExpr, DestructureBinding,
   Param, NamedReturn,
   Import, ImportGroup, ImportSingle, ImportItem,
   FuncDecl, FuncBody, ArrowBody, BlockBody,
@@ -107,7 +108,7 @@ function addError(p: Parser, span: Span, message: string): void {
 function synchronize(p: Parser): void {
   while (!at(p, 'EOF')) {
     // Statement/declaration boundaries
-    if (atAny(p, 'func', 'export', 'import', 'global', 'local', 'memory', 'define', 'end')) {
+    if (atAny(p, 'func', 'export', 'import', 'global', 'local', 'let', 'set', 'memory', 'define', 'def', 'end')) {
       return;
     }
     advance(p);
@@ -205,11 +206,47 @@ function parseType(p: Parser): Type {
     };
   }
 
-  // Primitive type: i32, u64, f64, etc.
+  // Struct type: { field: Type, field: Type }
+  if (match(p, '{')) {
+    const fields: StructField[] = [];
+
+    if (!at(p, '}')) {
+      const firstName = expect(p, 'NAME', 'Expected field name.');
+      expect(p, ':', 'Expected ":" after field name.');
+      const firstType = parseType(p);
+      fields.push({ name: firstName.text, type: firstType, span: spanFrom(firstName, firstType) });
+
+      while (match(p, ',')) {
+        if (at(p, '}')) break;  // Allow trailing comma
+        const fieldName = expect(p, 'NAME', 'Expected field name.');
+        expect(p, ':', 'Expected ":" after field name.');
+        const fieldType = parseType(p);
+        fields.push({ name: fieldName.text, type: fieldType, span: spanFrom(fieldName, fieldType) });
+      }
+    }
+
+    const end = expect(p, '}');
+    return {
+      kind: 'StructType',
+      fields,
+      span: spanFrom(start, end),
+    };
+  }
+
+  // Type name: primitive (i32, f64) or user-defined (Point, Color)
   if (at(p, 'NAME')) {
     const tok = advance(p);
+    const primitives = ['i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64', 'bool'];
+    if (primitives.includes(tok.text)) {
+      return {
+        kind: 'PrimitiveType',
+        name: tok.text,
+        span: tok.span,
+      };
+    }
+    // User-defined type name (must start with capital letter by convention)
     return {
-      kind: 'PrimitiveType',
+      kind: 'NamedType',
       name: tok.text,
       span: tok.span,
     };
@@ -266,11 +303,6 @@ function parseExpr(p: Parser, minPrec = 0): Expr {
     };
   }
 
-  // Check for ternary: expr ? expr : expr
-  if (match(p, '?')) {
-    // This is non-standard but shown in examples
-  }
-
   // Check for 'as' cast: expr as Type
   if (match(p, 'as')) {
     const type = parseType(p);
@@ -319,6 +351,30 @@ function parseUnary(p: Parser): Expr {
     return {
       kind: 'UnaryExpr',
       op: '~',
+      operand,
+      span: spanFrom(tok, operand),
+    };
+  }
+
+  // Length operator: #arr
+  if (tok.kind === '#') {
+    advance(p);
+    const operand = parseUnary(p);
+    return {
+      kind: 'UnaryExpr',
+      op: '#',
+      operand,
+      span: spanFrom(tok, operand),
+    };
+  }
+
+  // Address-of operator: &x
+  if (tok.kind === '&' && !isAtExprEnd(p, -1)) {
+    advance(p);
+    const operand = parseUnary(p);
+    return {
+      kind: 'UnaryExpr',
+      op: '&',
       operand,
       span: spanFrom(tok, operand),
     };
@@ -478,6 +534,44 @@ function parsePrimary(p: Parser): Expr {
     return first;
   }
 
+  // Struct literal: {x, y} or {x: value, y: value}
+  if (tok.kind === '{') {
+    advance(p);
+    const fields: StructLiteralField[] = [];
+
+    if (!at(p, '}')) {
+      // Parse first field
+      const firstName = expect(p, 'NAME', 'Expected field name.');
+      if (match(p, ':')) {
+        // Named field with value: {x: expr}
+        const value = parseExpr(p);
+        fields.push({ name: firstName.text, value, span: spanFrom(firstName, value) });
+      } else {
+        // Shorthand: {x} means {x: x}
+        fields.push({ name: firstName.text, span: firstName.span });
+      }
+
+      // Parse remaining fields
+      while (match(p, ',')) {
+        if (at(p, '}')) break;  // Allow trailing comma
+        const fieldName = expect(p, 'NAME', 'Expected field name.');
+        if (match(p, ':')) {
+          const value = parseExpr(p);
+          fields.push({ name: fieldName.text, value, span: spanFrom(fieldName, value) });
+        } else {
+          fields.push({ name: fieldName.text, span: fieldName.span });
+        }
+      }
+    }
+
+    const end = expect(p, '}');
+    return {
+      kind: 'StructLiteral',
+      fields,
+      span: spanFrom(tok, end),
+    };
+  }
+
   // Error: unexpected token
   addError(p, tok.span, `Expected an expression, but found '${tok.text}'.`);
   advance(p);
@@ -539,6 +633,16 @@ function parseStmt(p: Parser): Stmt {
     return parseLocalDecl(p);
   }
 
+  // Let statement: let x = expr OR let (a, b) = expr
+  if (at(p, 'let')) {
+    return parseLetStmt(p);
+  }
+
+  // Set statement: set (a, b) = expr
+  if (at(p, 'set')) {
+    return parseSetStmt(p);
+  }
+
   // Return statement: return expr [when cond]
   if (at(p, 'return')) {
     return parseReturnStmt(p);
@@ -564,10 +668,32 @@ function parseStmt(p: Parser): Stmt {
     return parseLoopStmt(p);
   }
 
-  // Break statement
+  // Break statement: break [when cond]
   if (at(p, 'break')) {
     const tok = advance(p);
-    return { kind: 'BreakStmt', span: tok.span };
+    let condition: Expr | undefined;
+    if (match(p, 'when')) {
+      condition = parseExpr(p);
+    }
+    return {
+      kind: 'BreakStmt',
+      condition,
+      span: condition ? spanFrom(tok, condition) : tok.span,
+    };
+  }
+
+  // Continue statement: continue [when cond]
+  if (at(p, 'continue')) {
+    const tok = advance(p);
+    let condition: Expr | undefined;
+    if (match(p, 'when')) {
+      condition = parseExpr(p);
+    }
+    return {
+      kind: 'ContinueStmt',
+      condition,
+      span: condition ? spanFrom(tok, condition) : tok.span,
+    };
   }
 
   // Branch statement: br [when cond]
@@ -615,6 +741,202 @@ function parseLocalDecl(p: Parser): LocalDecl {
   };
 }
 
+// let x = expr OR let (a, b) = expr - declares new variables
+function parseLetStmt(p: Parser): LocalDecl | LetStmt {
+  const start = expect(p, 'let');
+
+  // Check for tuple destructuring: let (a, b) = expr
+  if (at(p, '(')) {
+    advance(p);
+    const names: string[] = [];
+    const types: Type[] = [];
+
+    // Parse first name
+    const firstName = expect(p, 'NAME', 'Expected variable name in tuple destructuring.');
+    names.push(firstName.text);
+    if (match(p, ':')) {
+      types.push(parseType(p));
+    }
+
+    // Parse remaining names
+    while (match(p, ',')) {
+      const nameTok = expect(p, 'NAME', 'Expected variable name in tuple destructuring.');
+      names.push(nameTok.text);
+      if (match(p, ':')) {
+        types.push(parseType(p));
+      }
+    }
+
+    expect(p, ')');
+    expect(p, '=', 'Expected "=" in tuple destructuring.');
+    const value = parseExpr(p);
+
+    return {
+      kind: 'LetStmt',
+      pattern: 'tuple',
+      names,
+      types: types.length > 0 ? types : undefined,
+      value,
+      span: spanFrom(start, value),
+    };
+  }
+
+  // Check for struct destructuring: let {x, y} = expr OR let {x: a, y: b} = expr
+  if (at(p, '{')) {
+    advance(p);
+
+    const bindings: DestructureBinding[] = [];
+    const names: string[] = [];
+
+    if (!at(p, '}')) {
+      // Parse first binding
+      const firstTok = expect(p, 'NAME', 'Expected field name.');
+      if (match(p, ':')) {
+        // Explicit binding: {x: a}
+        const varTok = expect(p, 'NAME', 'Expected variable name.');
+        bindings.push({ field: firstTok.text, variable: varTok.text, span: spanFrom(firstTok, varTok) });
+        names.push(varTok.text);
+      } else {
+        // Shorthand: {x} means bind x to x
+        bindings.push({ field: firstTok.text, span: firstTok.span });
+        names.push(firstTok.text);
+      }
+
+      // Parse additional bindings
+      while (match(p, ',')) {
+        if (at(p, '}')) break;  // Allow trailing comma
+        const fieldTok = expect(p, 'NAME', 'Expected field name.');
+        if (match(p, ':')) {
+          const varTok = expect(p, 'NAME', 'Expected variable name.');
+          bindings.push({ field: fieldTok.text, variable: varTok.text, span: spanFrom(fieldTok, varTok) });
+          names.push(varTok.text);
+        } else {
+          bindings.push({ field: fieldTok.text, span: fieldTok.span });
+          names.push(fieldTok.text);
+        }
+      }
+    }
+
+    expect(p, '}', 'Expected "}" after field list.');
+    expect(p, '=', 'Expected "=" in let statement.');
+    const value = parseExpr(p);
+
+    return {
+      kind: 'LetStmt',
+      pattern: 'struct',
+      names,
+      bindings,
+      value,
+      span: spanFrom(start, value),
+    };
+  }
+
+  // Single variable: let x = expr
+  const nameTok = expect(p, 'NAME', 'Expected variable name after "let".');
+  const name = nameTok.text;
+
+  let type: Type | undefined;
+  if (match(p, ':')) {
+    type = parseType(p);
+  }
+
+  expect(p, '=', 'Expected "=" after variable name in let.');
+  const init = parseExpr(p);
+
+  return {
+    kind: 'LocalDecl',
+    name,
+    type,
+    init,
+    span: spanFrom(start, init),
+  };
+}
+
+// set (a, b) = expr OR set {x, y} = expr - assigns to existing variables with destructuring
+function parseSetStmt(p: Parser): SetStmt {
+  const start = expect(p, 'set');
+
+  // Check for struct destructuring: set {x, y} = expr
+  if (at(p, '{')) {
+    advance(p);
+
+    const bindings: DestructureBinding[] = [];
+
+    if (!at(p, '}')) {
+      // Parse first binding
+      const firstTok = expect(p, 'NAME', 'Expected field name.');
+      if (match(p, ':')) {
+        // Explicit binding: {x: a}
+        const varTok = expect(p, 'NAME', 'Expected variable name.');
+        bindings.push({ field: firstTok.text, variable: varTok.text, span: spanFrom(firstTok, varTok) });
+      } else {
+        // Shorthand: {x} means assign to x
+        bindings.push({ field: firstTok.text, span: firstTok.span });
+      }
+
+      // Parse additional bindings
+      while (match(p, ',')) {
+        if (at(p, '}')) break;  // Allow trailing comma
+        const fieldTok = expect(p, 'NAME', 'Expected field name.');
+        if (match(p, ':')) {
+          const varTok = expect(p, 'NAME', 'Expected variable name.');
+          bindings.push({ field: fieldTok.text, variable: varTok.text, span: spanFrom(fieldTok, varTok) });
+        } else {
+          bindings.push({ field: fieldTok.text, span: fieldTok.span });
+        }
+      }
+    }
+
+    expect(p, '}', 'Expected "}" after field list.');
+    expect(p, '=', 'Expected "=" in set statement.');
+    const value = parseExpr(p);
+
+    return {
+      kind: 'SetStmt',
+      pattern: 'struct',
+      targets: [],
+      bindings,
+      value,
+      span: spanFrom(start, value),
+    };
+  }
+
+  // Tuple destructuring: set (a, b) = expr
+  expect(p, '(', 'Expected "(" or "{" after "set".');
+
+  const targets: PlaceExpr[] = [];
+
+  // Parse first target
+  const firstExpr = parseExpr(p);
+  if (isPlaceExpr(firstExpr)) {
+    targets.push(firstExpr);
+  } else {
+    addError(p, firstExpr.span, 'Set target must be a variable, index expression, or member access.');
+  }
+
+  // Parse remaining targets
+  while (match(p, ',')) {
+    const expr = parseExpr(p);
+    if (isPlaceExpr(expr)) {
+      targets.push(expr);
+    } else {
+      addError(p, expr.span, 'Set target must be a variable, index expression, or member access.');
+    }
+  }
+
+  expect(p, ')');
+  expect(p, '=', 'Expected "=" in set statement.');
+  const value = parseExpr(p);
+
+  return {
+    kind: 'SetStmt',
+    pattern: 'tuple',
+    targets,
+    value,
+    span: spanFrom(start, value),
+  };
+}
+
 function parseReturnStmt(p: Parser): ReturnStmt {
   const start = expect(p, 'return');
 
@@ -658,7 +980,7 @@ function parseReturnStmt(p: Parser): ReturnStmt {
 }
 
 function isStatementStart(p: Parser): boolean {
-  return atAny(p, 'local', 'return', 'if', 'while', 'for', 'loop', 'break', 'br');
+  return atAny(p, 'local', 'let', 'set', 'return', 'if', 'while', 'for', 'loop', 'break', 'continue', 'br');
 }
 
 function parseIfStmt(p: Parser): IfStmt {
@@ -784,52 +1106,26 @@ function parseLoopStmt(p: Parser): LoopStmt {
   };
 }
 
+function isPlaceExpr(expr: Expr): expr is PlaceExpr {
+  return expr.kind === 'Identifier' || expr.kind === 'IndexExpr' || expr.kind === 'MemberExpr';
+}
+
 function parseExprOrAssignment(p: Parser): Stmt {
   // Parse first expression
   const first = parseExpr(p);
-
-  // Check for multi-target assignment: a, b = expr
-  if (at(p, ',')) {
-    const targets: Identifier[] = [];
-
-    if (first.kind !== 'Identifier') {
-      addError(p, first.span, 'Assignment target must be a variable name.');
-    } else {
-      targets.push(first);
-    }
-
-    while (match(p, ',')) {
-      const expr = parseExpr(p);
-      if (expr.kind !== 'Identifier') {
-        addError(p, expr.span, 'Assignment target must be a variable name.');
-      } else {
-        targets.push(expr);
-      }
-    }
-
-    expect(p, '=', 'Expected "=" in multi-target assignment.');
-    const value = parseExpr(p);
-
-    return {
-      kind: 'Assignment',
-      targets,
-      value,
-      span: spanFrom(first, value),
-    };
-  }
 
   // Check for simple assignment: a = expr
   if (at(p, '=')) {
     advance(p);
     const value = parseExpr(p);
 
-    if (first.kind !== 'Identifier') {
-      addError(p, first.span, 'Assignment target must be a variable name.');
+    if (!isPlaceExpr(first)) {
+      addError(p, first.span, 'Assignment target must be a variable, index expression, or member access. Use "set (a, b) = expr" for tuple destructuring.');
     }
 
     return {
       kind: 'Assignment',
-      targets: first.kind === 'Identifier' ? [first] : [],
+      targets: isPlaceExpr(first) ? [first] : [],
       value,
       span: spanFrom(first, value),
     };
@@ -842,13 +1138,13 @@ function parseExprOrAssignment(p: Parser): Stmt {
     advance(p);
     const value = parseExpr(p);
 
-    if (first.kind !== 'Identifier') {
-      addError(p, first.span, 'Compound assignment target must be a variable name.');
+    if (!isPlaceExpr(first)) {
+      addError(p, first.span, 'Compound assignment target must be a variable, index expression, or member access.');
     }
 
     return {
       kind: 'Assignment',
-      targets: first.kind === 'Identifier' ? [first] : [],
+      targets: isPlaceExpr(first) ? [first] : [],
       op: tok.kind,
       value,
       span: spanFrom(first, value),
@@ -1116,7 +1412,8 @@ function parseExport(p: Parser): ExportDecl {
 function parseGlobal(p: Parser): GlobalDecl {
   const start = expect(p, 'global');
 
-  const mutable = !!match(p, 'mut');
+  // Note: 'mut' keyword support would be added here if needed
+  const mutable = false;
   const nameTok = expect(p, 'NAME', 'Expected global variable name.');
   const name = nameTok.text;
 
@@ -1157,12 +1454,47 @@ function parseMemory(p: Parser): MemoryDecl {
   };
 }
 
+function parseDefine(p: Parser): DefineDecl {
+  const start = advance(p);  // consume 'def' or 'define'
+  const nameTok = expect(p, 'NAME', 'Expected constant name after "def".');
+  const name = nameTok.text;
+
+  expect(p, '=', 'Expected "=" in constant definition.');
+  const value = parseExpr(p);
+
+  return {
+    kind: 'DefineDecl',
+    name,
+    value,
+    span: spanFrom(start, value),
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Type Alias Parsing
+// -----------------------------------------------------------------------------
+
+function parseTypeAlias(p: Parser): TypeAliasDecl {
+  const start = expect(p, 'type');
+  const nameTok = expect(p, 'NAME', 'Expected type name after "type".');
+  const name = nameTok.text;
+  expect(p, '=', 'Expected "=" in type alias declaration.');
+  const type = parseType(p);
+  return {
+    kind: 'TypeAliasDecl',
+    name,
+    type,
+    span: spanFrom(start, type),
+  };
+}
+
 function parseModule(p: Parser): Module {
   const imports: Import[] = [];
   const exports: ExportDecl[] = [];
   const globals: GlobalDecl[] = [];
   const memories: MemoryDecl[] = [];
   const defines: DefineDecl[] = [];
+  const types: TypeAliasDecl[] = [];
   const functions: FuncDecl[] = [];
 
   const start = peek(p);
@@ -1178,10 +1510,14 @@ function parseModule(p: Parser): Module {
       memories.push(parseMemory(p));
     } else if (at(p, 'func')) {
       functions.push(parseFuncDecl(p));
+    } else if (atAny(p, 'def', 'define')) {
+      defines.push(parseDefine(p));
+    } else if (at(p, 'type')) {
+      types.push(parseTypeAlias(p));
     } else {
       // Unexpected token
       const tok = peek(p);
-      addError(p, tok.span, `Unexpected '${tok.text}' at module level. Expected: import, export, func, global, or memory.`);
+      addError(p, tok.span, `Unexpected '${tok.text}' at module level. Expected: import, export, func, global, memory, type, or def.`);
       synchronize(p);
     }
   }
@@ -1195,6 +1531,7 @@ function parseModule(p: Parser): Module {
     globals,
     memories,
     defines,
+    types,
     functions,
     span: { start: start.span.start, end: end.span.end },
   };

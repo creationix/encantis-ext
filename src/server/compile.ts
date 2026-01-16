@@ -4,36 +4,29 @@
 // =============================================================================
 
 import type {
-  CheckResult, Diagnostic, Expr, FuncBody, FuncDecl,
-  Module, ParseResult, Span, Stmt, Token, Type, SymbolTable,
+  Body, CheckResult, Decl, Diagnostic, Expr, ExportDecl, FuncDecl,
+  GlobalDecl, ImportDecl, MemoryDecl, Module, ParseResult, Span, Stmt, Type, SymbolTable,
 } from './types';
 
 import { check as doCheck } from './checker';
-import { formatDiagnostic, getLineAndColumn, tokenize } from './lexer';
-import { parse as doParse } from './parser';
+import { parse as doParse } from './parser2';
 
 // Re-export types for consumers
-export type { Token, Diagnostic, ParseResult, CheckResult, Module, Span };
-export { tokenize, formatDiagnostic, getLineAndColumn };
+export type { Diagnostic, ParseResult, CheckResult, Module, Span };
 
 // -----------------------------------------------------------------------------
 // Source Mapping (for WAT preview click-to-source)
 // -----------------------------------------------------------------------------
 
 export interface SourceMapping {
-  watLine: number;    // 0-based line number in WAT output
-  sourceSpan: Span;   // byte offset span in source
+  watLine: number;
+  sourceSpan: Span;
 }
 
 // -----------------------------------------------------------------------------
 // Parse API
 // -----------------------------------------------------------------------------
 
-/**
- * Parse Encantis source code into an AST.
- * Returns the AST and any syntax errors encountered.
- * The parser is error-tolerant and will return a partial AST even with errors.
- */
 export function parse(src: string): ParseResult {
   return doParse(src);
 }
@@ -42,61 +35,40 @@ export function parse(src: string): ParseResult {
 // Check API
 // -----------------------------------------------------------------------------
 
-/**
- * Perform semantic analysis on a parsed AST.
- * Checks for undefined variables, type mismatches, etc.
- * Returns the combined errors from parsing and checking.
- */
 export function check(parseResult: ParseResult, src: string): CheckResult {
   return doCheck(parseResult, src);
 }
 
-/**
- * Parse and check source code in one step.
- * Convenience function that combines parse() and check().
- */
 export function analyze(src: string): CheckResult {
   const parseResult = parse(src);
   return check(parseResult, src);
 }
 
 // -----------------------------------------------------------------------------
-// Compile API (WAT generation - placeholder for now)
+// Compile API
 // -----------------------------------------------------------------------------
 
-/**
- * Compile Encantis source code to WebAssembly Text Format (WAT).
- * Currently a placeholder - full codegen will be added later.
- */
 export function compile(src: string): string {
   const result = compileWithSourceMap(src);
   return result.wat;
 }
 
-/**
- * Compile Encantis source code to WAT with source mapping.
- * Used by the WAT preview feature for click-to-navigate.
- */
 export function compileWithSourceMap(src: string): { wat: string; sourceMap: SourceMapping[] } {
   const parseResult = parse(src);
   const checkResult = check(parseResult, src);
 
   if (checkResult.errors.some(e => e.severity === 'error')) {
-    // Return error summary as WAT comment with no source map
     const errorLines = checkResult.errors
       .filter(e => e.severity === 'error')
-      .map(e => `;; ERROR: ${formatDiagnostic(src, e).replace(/\n/g, '\n;; ')}`);
-    return {
-      wat: `;; Compilation failed\n${errorLines.join('\n')}`,
-      sourceMap: [],
-    };
+      .map(e => `;; ERROR: ${e.message}`);
+    return { wat: `;; Compilation failed\n${errorLines.join('\n')}`, sourceMap: [] };
   }
 
-  return generateWatWithSourceMap(parseResult.ast, checkResult.symbols, src);
+  return generateWat(parseResult.ast, checkResult.symbols, src);
 }
 
 // -----------------------------------------------------------------------------
-// WAT Code Generation (Basic Implementation)
+// Code Generation Context
 // -----------------------------------------------------------------------------
 
 interface CodeGenContext {
@@ -106,9 +78,9 @@ interface CodeGenContext {
   stringOffset: number;
   src: string;
   sourceMap: SourceMapping[];
-  globals: Set<string>;  // Track global variable names
-  symbols: SymbolTable;  // Type information from checker
-  currentFunc?: FuncDecl;  // Current function for scope lookup
+  globals: Set<string>;
+  symbols: SymbolTable;
+  currentFunc?: FuncDecl;
 }
 
 function emit(ctx: CodeGenContext, line: string): void {
@@ -124,276 +96,62 @@ function emitWithSpan(ctx: CodeGenContext, line: string, span?: Span): void {
 }
 
 // -----------------------------------------------------------------------------
-// Type Inference Helpers
+// Type Helpers
 // -----------------------------------------------------------------------------
 
-/**
- * Infer the type of an expression using the symbol table.
- */
-function inferExprType(ctx: CodeGenContext, expr: Expr): Type | undefined {
-  switch (expr.kind) {
-    case 'Identifier': {
-      // Look up in current function scope first, then global
-      const funcScope = ctx.currentFunc ? ctx.symbols.scopes.get(ctx.currentFunc) : undefined;
-      let sym = funcScope?.symbols.get(expr.name);
-      if (!sym) sym = ctx.symbols.global.symbols.get(expr.name);
-      return sym?.type;
+function typeToWat(type: Type): string {
+  switch (type.kind) {
+    case 'PrimitiveType': {
+      if (type.name === 'f64') return 'f64';
+      if (type.name === 'f32') return 'f32';
+      if (type.name === 'i64' || type.name === 'u64') return 'i64';
+      return 'i32';
     }
-    case 'NumberLiteral':
-      if (expr.suffix) {
-        return { kind: 'PrimitiveType', name: expr.suffix, span: expr.span };
-      }
-      if (expr.value.includes('.') || expr.value.includes('e') || expr.value.includes('E')) {
-        return { kind: 'PrimitiveType', name: 'f64', span: expr.span };
-      }
-      return { kind: 'PrimitiveType', name: 'i32', span: expr.span };
-    case 'BinaryExpr': {
-      // Result type is the promoted type of both operands
-      const leftType = inferExprType(ctx, expr.left);
-      const rightType = inferExprType(ctx, expr.right);
-      const leftWat = getWatPrefix(leftType);
-      const rightWat = getWatPrefix(rightType);
-      // Use whichever is wider in the type hierarchy
-      const resultWat = (typeRank as Record<string, number>)[leftWat] >= (typeRank as Record<string, number>)[rightWat]
-        ? leftWat : rightWat;
-      return { kind: 'PrimitiveType', name: resultWat, span: expr.span };
-    }
-    case 'CallExpr': {
-      if (expr.callee.kind === 'Identifier') {
-        const sym = ctx.symbols.global.symbols.get(expr.callee.name);
-        if (sym?.type?.kind === 'FunctionType') {
-          return sym.type.returns;
-        }
-      }
-      return undefined;
-    }
-    case 'TupleExpr':
-      return {
-        kind: 'TupleType',
-        elements: expr.elements.map(e => inferExprType(ctx, e)).filter((t): t is Type => t !== undefined),
-        span: expr.span,
-      };
-    default:
-      return undefined;
+    case 'SliceType': return 'i32 i32';
+    case 'PointerType': return 'i32';
+    case 'TupleType': return type.elements.map(typeToWat).join(' ');
+    default: return 'i32';
   }
 }
 
-/**
- * Get the WAT type prefix (i32, i64, f32, f64) for a given type.
- */
 function getWatPrefix(type: Type | undefined): string {
   if (!type || type.kind !== 'PrimitiveType') return 'i32';
   switch (type.name) {
     case 'f64': return 'f64';
     case 'f32': return 'f32';
     case 'i64': case 'u64': return 'i64';
-    default: return 'i32';  // i32, u32, i16, u16, i8, u8
+    default: return 'i32';
   }
 }
 
-/**
- * Check if a type is unsigned (for choosing signed vs unsigned conversions).
- */
-function isUnsignedType(type: Type | undefined): boolean {
-  if (!type || type.kind !== 'PrimitiveType') return false;
-  return type.name.startsWith('u');
-}
-
-/**
- * Check if converting an integer type to a float type is lossless.
- * - f32 has 24-bit mantissa: safe for i8, u8, i16, u16
- * - f64 has 53-bit mantissa: safe for i8, u8, i16, u16, i32, u32
- */
-function isLosslessIntToFloat(intType: Type | undefined, floatWat: WatType): boolean {
-  if (!intType || intType.kind !== 'PrimitiveType') return false;
-
-  const smallInts = ['i8', 'u8', 'i16', 'u16'];
-  const mediumInts = ['i32', 'u32'];
-
-  if (floatWat === 'f64') {
-    // f64 can safely hold i8, u8, i16, u16, i32, u32
-    return smallInts.includes(intType.name) || mediumInts.includes(intType.name);
-  } else if (floatWat === 'f32') {
-    // f32 can only safely hold i8, u8, i16, u16
-    return smallInts.includes(intType.name);
+function inferExprType(ctx: CodeGenContext, expr: Expr): Type | undefined {
+  switch (expr.kind) {
+    case 'Identifier': {
+      const funcScope = ctx.currentFunc ? ctx.symbols.scopes.get(ctx.currentFunc) : undefined;
+      let sym = funcScope?.symbols.get(expr.name);
+      if (!sym) sym = ctx.symbols.global.symbols.get(expr.name);
+      return sym?.type;
+    }
+    case 'NumberLit': {
+      if (expr.value.includes('.') || expr.value.includes('e') || expr.value.includes('E')) {
+        return { kind: 'PrimitiveType', name: 'f64', span: expr.span };
+      }
+      return { kind: 'PrimitiveType', name: 'i32', span: expr.span };
+    }
+    case 'BinaryExpr': {
+      const leftType = inferExprType(ctx, expr.left);
+      return leftType;
+    }
+    default:
+      return undefined;
   }
-  return false;
-}
-
-/**
- * Check if a comptime (untyped) integer literal can be losslessly converted to float.
- * Since we know the exact value, we can check if it fits in the mantissa.
- * - f32: 24-bit mantissa → exact integers in [-2^24, 2^24]
- * - f64: 53-bit mantissa → exact integers in [-2^53, 2^53]
- */
-function isComptimeLiteralSafeForFloat(expr: Expr, floatWat: WatType): boolean {
-  if (expr.kind !== 'NumberLiteral') return false;
-  // If it has a suffix, it's not a comptime/untyped literal
-  if (expr.suffix) return false;
-  // If it's already a float literal, no int→float conversion needed
-  if (expr.value.includes('.') || expr.value.includes('e') || expr.value.includes('E')) return false;
-
-  const value = parseInt(expr.value, 10);
-  if (Number.isNaN(value)) return false;
-
-  // Check if the integer value fits exactly in the float's mantissa
-  if (floatWat === 'f32') {
-    // f32 has 24-bit mantissa: [-16777216, 16777216]
-    const MAX_SAFE_F32 = 2 ** 24;
-    return value >= -MAX_SAFE_F32 && value <= MAX_SAFE_F32;
-  } else if (floatWat === 'f64') {
-    // f64 has 53-bit mantissa: [-9007199254740992, 9007199254740992]
-    const MAX_SAFE_F64 = 2 ** 53;
-    return value >= -MAX_SAFE_F64 && value <= MAX_SAFE_F64;
-  }
-  return false;
 }
 
 // -----------------------------------------------------------------------------
-// Binary Operation Type Promotion
+// WAT Generation
 // -----------------------------------------------------------------------------
 
-type WatType = 'i32' | 'i64' | 'f32' | 'f64';
-
-interface BinaryOpResult {
-  resultType: WatType;
-  convertLeft?: string;   // WASM instruction to convert left operand
-  convertRight?: string;  // WASM instruction to convert right operand
-  op: string;             // The WASM operation to use
-}
-
-/**
- * Type promotion hierarchy: i32 < i64 < f32 < f64
- * Implicit promotion always goes to the wider type.
- */
-const typeRank: Record<WatType, number> = {
-  'i32': 0,
-  'i64': 1,
-  'f32': 2,
-  'f64': 3,
-};
-
-/**
- * Conversion instructions from one type to another.
- * Key format: "fromType_toType_signed" where signed is 's' or 'u'
- */
-function getConversion(from: WatType, to: WatType, unsigned: boolean): string | undefined {
-  const suffix = unsigned ? 'u' : 's';
-  const conversionMap: Record<string, string> = {
-    // i32 → wider types
-    'i32_i64': `i64.extend_i32_${suffix}`,
-    'i32_f32': `f32.convert_i32_${suffix}`,
-    'i32_f64': `f64.convert_i32_${suffix}`,
-    // i64 → float types
-    'i64_f32': `f32.convert_i64_${suffix}`,
-    'i64_f64': `f64.convert_i64_${suffix}`,
-    // f32 → f64
-    'f32_f64': 'f64.promote_f32',
-  };
-  return conversionMap[`${from}_${to}`];
-}
-
-/**
- * Resolve binary operation with type promotion.
- * Returns the operation info including any needed conversions, or undefined if types are incompatible.
- * Optionally accepts expressions to check comptime literals for more precise conversion checks.
- */
-function resolveBinaryOp(
-  op: string,
-  leftType: Type | undefined,
-  rightType: Type | undefined,
-  leftExpr?: Expr,
-  rightExpr?: Expr,
-): BinaryOpResult | undefined {
-  const leftWat = getWatPrefix(leftType) as WatType;
-  const rightWat = getWatPrefix(rightType) as WatType;
-  const leftUnsigned = isUnsignedType(leftType);
-  const rightUnsigned = isUnsignedType(rightType);
-
-  // Determine result type (promote to wider)
-  let resultType: WatType;
-  let convertLeft: string | undefined;
-  let convertRight: string | undefined;
-
-  const leftIsInt = leftWat === 'i32' || leftWat === 'i64';
-  const rightIsInt = rightWat === 'i32' || rightWat === 'i64';
-  const leftIsFloat = leftWat === 'f32' || leftWat === 'f64';
-  const rightIsFloat = rightWat === 'f32' || rightWat === 'f64';
-
-  if (leftWat === rightWat) {
-    // Same type, no conversion needed
-    resultType = leftWat;
-  } else if (typeRank[leftWat] > typeRank[rightWat]) {
-    // Left is wider, promote right
-    resultType = leftWat;
-    // Check for lossy int→float conversion (allow comptime literals if value fits)
-    if (rightIsInt && leftIsFloat) {
-      const isComptimeSafe = rightExpr && isComptimeLiteralSafeForFloat(rightExpr, leftWat);
-      if (!isComptimeSafe && !isLosslessIntToFloat(rightType, leftWat)) {
-        return undefined; // Precision loss: require explicit cast
-      }
-    }
-    convertRight = getConversion(rightWat, leftWat, rightUnsigned);
-    if (!convertRight) return undefined; // Incompatible types
-  } else {
-    // Right is wider, promote left
-    resultType = rightWat;
-    // Check for lossy int→float conversion (allow comptime literals if value fits)
-    if (leftIsInt && rightIsFloat) {
-      const isComptimeSafe = leftExpr && isComptimeLiteralSafeForFloat(leftExpr, rightWat);
-      if (!isComptimeSafe && !isLosslessIntToFloat(leftType, rightWat)) {
-        return undefined; // Precision loss: require explicit cast
-      }
-    }
-    convertLeft = getConversion(leftWat, rightWat, leftUnsigned);
-    if (!convertLeft) return undefined; // Incompatible types
-  }
-
-  const isFloat = resultType === 'f64' || resultType === 'f32';
-
-  // Build the operation string
-  const opMap: Record<string, string> = {
-    '+': `${resultType}.add`,
-    '-': `${resultType}.sub`,
-    '*': `${resultType}.mul`,
-    '/': isFloat ? `${resultType}.div` : `${resultType}.div_s`,
-    '%': `${resultType}.rem_s`,  // integers only
-    '&': `${resultType}.and`,    // integers only
-    '|': `${resultType}.or`,     // integers only
-    '^': `${resultType}.xor`,    // integers only
-    '<<': `${resultType}.shl`,   // integers only
-    '>>': `${resultType}.shr_s`, // integers only
-    '<<<': `${resultType}.rotl`, // integers only
-    '>>>': `${resultType}.rotr`, // integers only
-    '<': isFloat ? `${resultType}.lt` : `${resultType}.lt_s`,
-    '>': isFloat ? `${resultType}.gt` : `${resultType}.gt_s`,
-    '<=': isFloat ? `${resultType}.le` : `${resultType}.le_s`,
-    '>=': isFloat ? `${resultType}.ge` : `${resultType}.ge_s`,
-    '==': `${resultType}.eq`,
-    '!=': `${resultType}.ne`,
-  };
-
-  const watOp = opMap[op];
-  if (!watOp) return undefined;
-
-  // Validate: bitwise/rem ops don't work on floats
-  if (isFloat && ['%', '&', '|', '^', '<<', '>>', '<<<', '>>>'].includes(op)) {
-    return undefined; // Type error: bitwise ops on floats
-  }
-
-  return { resultType, convertLeft, convertRight, op: watOp };
-}
-
-function generateGlobalInit(expr: Expr): string {
-  // For global initialization, we need a constant expression
-  if (expr.kind === 'NumberLiteral') {
-    return expr.value;
-  }
-  // TODO: handle other constant expressions
-  return '0';
-}
-
-function generateWatWithSourceMap(module: Module, symbols: SymbolTable, src: string): { wat: string; sourceMap: SourceMapping[] } {
+function generateWat(module: Module, symbols: SymbolTable, src: string): { wat: string; sourceMap: SourceMapping[] } {
   const ctx: CodeGenContext = {
     output: [],
     indent: 0,
@@ -405,61 +163,49 @@ function generateWatWithSourceMap(module: Module, symbols: SymbolTable, src: str
     symbols,
   };
 
-  // Collect global names first
-  for (const global of module.globals) {
-    ctx.globals.add(global.name);
+  // Collect globals first
+  for (const decl of module.decls) {
+    if (decl.kind === 'GlobalDecl') {
+      ctx.globals.add(decl.name);
+    }
   }
 
   emit(ctx, '(module');
   ctx.indent++;
 
   // Generate imports
-  for (const imp of module.imports) {
-    if (imp.kind === 'ImportGroup') {
-      for (const item of imp.items) {
-        const localName = item.localName || item.exportName;
-        const params = item.params.map(p => `(param ${typeToWat(p.type)})`).join(' ');
-        const result = item.returnType ? `(result ${typeToWat(item.returnType)})` : '';
-        emitWithSpan(ctx, `(func $${localName} (import "${imp.module}" "${item.exportName}") ${params} ${result})`, imp.span);
-      }
-    } else {
-      const localName = imp.localName || imp.exportName;
-      const params = imp.funcType.params.map(t => typeToWat(t)).join(' ');
-      const paramsStr = params ? `(param ${params})` : '';
-      const returns = imp.funcType.returns;
-      const result = returns.kind !== 'TupleType' || (returns.kind === 'TupleType' && returns.elements.length > 0)
-        ? `(result ${typeToWat(imp.funcType.returns)})`
-        : '';
-      emitWithSpan(ctx, `(func $${localName} (import "${imp.module}" "${imp.exportName}") ${paramsStr} ${result})`, imp.span);
+  for (const decl of module.decls) {
+    if (decl.kind === 'ImportDecl') {
+      generateImport(ctx, decl);
     }
   }
 
   // Generate globals
-  for (const global of module.globals) {
-    const watType = global.type ? typeToWat(global.type) : 'i32';
-    const mutability = global.mutable ? `(mut ${watType})` : watType;
-    const initValue = generateGlobalInit(global.init);
-    emit(ctx, `(global $${global.name} ${mutability} (${watType}.const ${initValue}))`);
+  for (const decl of module.decls) {
+    if (decl.kind === 'GlobalDecl') {
+      generateGlobal(ctx, decl);
+    }
   }
 
-  // Generate exports
-  for (const exp of module.exports) {
-    if (exp.decl.kind === 'FuncDecl') {
-      generateFunction(ctx, exp.decl, exp.exportName);
-    } else if (exp.decl.kind === 'MemoryDecl') {
-      emitWithSpan(ctx, `(memory (export "${exp.exportName}") ${exp.decl.pages})`, exp.decl.span);
+  // Generate exports (functions and memory)
+  for (const decl of module.decls) {
+    if (decl.kind === 'ExportDecl') {
+      generateExport(ctx, decl);
     }
   }
 
   // Generate non-exported functions
-  for (const func of module.functions) {
-    if (func.name) {
-      generateFunction(ctx, func);
+  for (const decl of module.decls) {
+    if (decl.kind === 'FuncDecl' && decl.name) {
+      generateFunction(ctx, decl);
     }
   }
 
-  // Generate memory if not already exported
-  const hasMemory = module.exports.some(e => e.decl.kind === 'MemoryDecl') || module.memories.length > 0;
+  // Generate memory if needed for strings
+  const hasMemory = module.decls.some(d =>
+    d.kind === 'MemoryDecl' ||
+    (d.kind === 'ExportDecl' && d.decl.kind === 'MemoryDecl')
+  );
   if (!hasMemory && ctx.strings.size > 0) {
     emit(ctx, '(memory 1)');
   }
@@ -474,30 +220,62 @@ function generateWatWithSourceMap(module: Module, symbols: SymbolTable, src: str
   ctx.indent--;
   emit(ctx, ')');
 
-  return {
-    wat: ctx.output.join('\n'),
-    sourceMap: ctx.sourceMap,
-  };
+  return { wat: ctx.output.join('\n'), sourceMap: ctx.sourceMap };
+}
+
+function generateImport(ctx: CodeGenContext, imp: ImportDecl): void {
+  for (const item of imp.items) {
+    if (item.item.kind === 'func') {
+      const sig = item.item.signature;
+      const params = sig.params.map(p => `(param ${typeToWat(p.type)})`).join(' ');
+      const returns = sig.returns;
+      let result = '';
+      if (returns) {
+        if ('kind' in returns && returns.kind === 'NamedReturns') {
+          result = `(result ${returns.fields.map(f => typeToWat(f.type)).join(' ')})`;
+        } else {
+          result = `(result ${typeToWat(returns as Type)})`;
+        }
+      }
+      emitWithSpan(ctx, `(func $${item.externalName} (import "${imp.module}" "${item.externalName}") ${params} ${result})`, imp.span);
+    } else if (item.item.kind === 'memory') {
+      emitWithSpan(ctx, `(memory (import "${imp.module}" "${item.externalName}") ${item.item.pages})`, imp.span);
+    }
+  }
+}
+
+function generateGlobal(ctx: CodeGenContext, global: GlobalDecl): void {
+  const watType = global.type ? typeToWat(global.type) : 'i32';
+  const initValue = global.init?.kind === 'NumberLit' ? global.init.value : '0';
+  emit(ctx, `(global $${global.name} (mut ${watType}) (${watType}.const ${initValue}))`);
+}
+
+function generateExport(ctx: CodeGenContext, exp: ExportDecl): void {
+  if (exp.decl.kind === 'FuncDecl') {
+    generateFunction(ctx, exp.decl, exp.exportName);
+  } else if (exp.decl.kind === 'MemoryDecl') {
+    emitWithSpan(ctx, `(memory (export "${exp.exportName}") ${exp.decl.minPages})`, exp.decl.span);
+  }
 }
 
 function generateFunction(ctx: CodeGenContext, func: FuncDecl, exportName?: string): void {
-  ctx.currentFunc = func;  // Set for type lookups in this function's scope
-
+  ctx.currentFunc = func;
   const name = func.name || exportName || 'anonymous';
   const exportClause = exportName ? `(export "${exportName}")` : '';
 
   // Build params
-  const params = func.params.map(p => `(param $${p.name} ${typeToWat(p.type)})`).join(' ');
+  const params = func.signature.params
+    .filter(p => p.name)
+    .map(p => `(param $${p.name} ${typeToWat(p.type)})`).join(' ');
 
   // Build results
   let results = '';
-  if (func.returnType) {
-    if ('params' in func.returnType) {
-      // Named returns
-      const namedReturn = func.returnType as { params: Array<{ name: string; type: Type }> };
-      results = `(result ${namedReturn.params.map(p => typeToWat(p.type)).join(' ')})`;
+  const returns = func.signature.returns;
+  if (returns) {
+    if ('kind' in returns && returns.kind === 'NamedReturns') {
+      results = `(result ${returns.fields.map(f => typeToWat(f.type)).join(' ')})`;
     } else {
-      results = `(result ${typeToWat(func.returnType)})`;
+      results = `(result ${typeToWat(returns as Type)})`;
     }
   }
 
@@ -505,48 +283,40 @@ function generateFunction(ctx: CodeGenContext, func: FuncDecl, exportName?: stri
   ctx.indent++;
 
   // Collect locals from body
-  if (func.body?.kind === 'BlockBody') {
+  if (func.body.kind === 'BlockBody') {
     for (const stmt of func.body.stmts) {
-      if (stmt.kind === 'LocalDecl' && stmt.type) {
-        emit(ctx, `(local $${stmt.name} ${typeToWat(stmt.type)})`);
+      if (stmt.kind === 'LetStmt' && stmt.pattern.kind === 'IdentPattern' && stmt.type) {
+        emit(ctx, `(local $${stmt.pattern.name} ${typeToWat(stmt.type)})`);
       }
     }
   }
 
   // Named returns are also locals
-  if (func.returnType && 'params' in func.returnType) {
-    const namedReturn = func.returnType as { params: Array<{ name: string; type: Type }> };
-    for (const ret of namedReturn.params) {
+  if (returns && 'kind' in returns && returns.kind === 'NamedReturns') {
+    for (const ret of returns.fields) {
       emit(ctx, `(local $${ret.name} ${typeToWat(ret.type)})`);
     }
   }
 
   // Generate body
-  if (func.body) {
-    generateFuncBody(ctx, func.body, func);
-  }
+  generateBody(ctx, func.body, func);
 
   ctx.indent--;
   emit(ctx, ')');
-  ctx.currentFunc = undefined;  // Clear after function generation
+  ctx.currentFunc = undefined;
 }
 
-function generateFuncBody(ctx: CodeGenContext, body: FuncBody, func: FuncDecl): void {
+function generateBody(ctx: CodeGenContext, body: Body, func: FuncDecl): void {
   if (body.kind === 'ArrowBody') {
-    // Arrow body: just the expressions
-    for (const expr of body.exprs) {
-      generateExpr(ctx, expr);
-    }
+    generateExpr(ctx, body.expr);
   } else {
-    // Block body: statements
     for (const stmt of body.stmts) {
       generateStmt(ctx, stmt);
     }
-
     // Return named return values
-    if (func.returnType && 'params' in func.returnType) {
-      const namedReturn = func.returnType as { params: Array<{ name: string }> };
-      for (const ret of namedReturn.params) {
+    const returns = func.signature.returns;
+    if (returns && 'kind' in returns && returns.kind === 'NamedReturns') {
+      for (const ret of returns.fields) {
         emit(ctx, `(local.get $${ret.name})`);
       }
     }
@@ -555,59 +325,23 @@ function generateFuncBody(ctx: CodeGenContext, body: FuncBody, func: FuncDecl): 
 
 function generateStmt(ctx: CodeGenContext, stmt: Stmt): void {
   switch (stmt.kind) {
-    case 'LocalDecl':
-      if (stmt.init) {
+    case 'LetStmt':
+      if (stmt.init && stmt.pattern.kind === 'IdentPattern') {
         generateExpr(ctx, stmt.init);
-        emit(ctx, `(local.set $${stmt.name})`);
+        emit(ctx, `(local.set $${stmt.pattern.name})`);
       }
       break;
 
-    case 'Assignment':
-      if (stmt.op) {
-        // Compound assignment: target op= value  ->  target = target op value
-        // Only works for single target
-        const target = stmt.targets[0];
-        const isGlobal = ctx.globals.has(target.name);
-        const targetType = inferExprType(ctx, target);
-        const prefix = getWatPrefix(targetType);
-        const isFloat = prefix === 'f64' || prefix === 'f32';
-
-        emit(ctx, `(${isGlobal ? 'global' : 'local'}.get $${target.name})`);
-        generateExpr(ctx, stmt.value);
-
-        // Map compound op to WAT instruction with correct type prefix
-        const opMap: Record<string, string> = {
-          '+=': `${prefix}.add`,
-          '-=': `${prefix}.sub`,
-          '*=': `${prefix}.mul`,
-          '/=': isFloat ? `${prefix}.div` : `${prefix}.div_s`,
-          '%=': `${prefix}.rem_s`,  // integers only
-          '&=': `${prefix}.and`,    // integers only
-          '|=': `${prefix}.or`,     // integers only
-          '^=': `${prefix}.xor`,    // integers only
-          '<<=': `${prefix}.shl`,   // integers only
-          '>>=': `${prefix}.shr_s`, // integers only
-          '<<<=': `${prefix}.rotl`, // integers only
-          '>>>=': `${prefix}.rotr`, // integers only
-        };
-        const watOp = opMap[stmt.op] || `${prefix}.add`;
-        emit(ctx, `(${watOp})`);
-        emit(ctx, `(${isGlobal ? 'global' : 'local'}.set $${target.name})`);
-      } else {
-        // Simple assignment
-        generateExpr(ctx, stmt.value);
-        // For multiple targets, WAT pops in reverse order
-        for (let i = stmt.targets.length - 1; i >= 0; i--) {
-          const t = stmt.targets[i];
-          const isGlobal = ctx.globals.has(t.name);
-          emit(ctx, `(${isGlobal ? 'global' : 'local'}.set $${t.name})`);
-        }
+    case 'AssignStmt':
+      generateExpr(ctx, stmt.value);
+      if (stmt.target.kind === 'Identifier') {
+        const isGlobal = ctx.globals.has(stmt.target.name);
+        emit(ctx, `(${isGlobal ? 'global' : 'local'}.set $${stmt.target.name})`);
       }
       break;
 
     case 'ExprStmt':
       generateExpr(ctx, stmt.expr);
-      // Drop result if not used
       emit(ctx, '(drop)');
       break;
 
@@ -618,7 +352,48 @@ function generateStmt(ctx: CodeGenContext, stmt: Stmt): void {
       }
       break;
 
-    // TODO: Implement other statements (if, while, for, etc.)
+    case 'IfStmt':
+      generateExpr(ctx, stmt.condition);
+      emit(ctx, '(if');
+      ctx.indent++;
+      emit(ctx, '(then');
+      ctx.indent++;
+      if (stmt.thenBody.kind === 'BlockBody') {
+        for (const s of stmt.thenBody.stmts) generateStmt(ctx, s);
+      }
+      ctx.indent--;
+      emit(ctx, ')');
+      if (stmt.elseBody) {
+        emit(ctx, '(else');
+        ctx.indent++;
+        if (stmt.elseBody.kind === 'BlockBody') {
+          for (const s of stmt.elseBody.stmts) generateStmt(ctx, s);
+        }
+        ctx.indent--;
+        emit(ctx, ')');
+      }
+      ctx.indent--;
+      emit(ctx, ')');
+      break;
+
+    case 'WhileStmt':
+      emit(ctx, '(block $break');
+      ctx.indent++;
+      emit(ctx, '(loop $continue');
+      ctx.indent++;
+      generateExpr(ctx, stmt.condition);
+      emit(ctx, '(i32.eqz)');
+      emit(ctx, '(br_if $break)');
+      if (stmt.body.kind === 'BlockBody') {
+        for (const s of stmt.body.stmts) generateStmt(ctx, s);
+      }
+      emit(ctx, '(br $continue)');
+      ctx.indent--;
+      emit(ctx, ')');
+      ctx.indent--;
+      emit(ctx, ')');
+      break;
+
     default:
       emit(ctx, `;; TODO: ${stmt.kind}`);
   }
@@ -626,20 +401,23 @@ function generateStmt(ctx: CodeGenContext, stmt: Stmt): void {
 
 function generateExpr(ctx: CodeGenContext, expr: Expr): void {
   switch (expr.kind) {
-    case 'NumberLiteral': {
-      const literalType = inferExprType(ctx, expr);
-      const prefix = getWatPrefix(literalType);
+    case 'NumberLit': {
+      const type = inferExprType(ctx, expr);
+      const prefix = getWatPrefix(type);
       emit(ctx, `(${prefix}.const ${expr.value})`);
       break;
     }
 
-    case 'StringLiteral': {
-      // Register string and emit ptr/len
+    case 'StringLit': {
       const offset = registerString(ctx, expr.value);
       emit(ctx, `(i32.const ${offset})`);
       emit(ctx, `(i32.const ${expr.value.length})`);
       break;
     }
+
+    case 'BoolLit':
+      emit(ctx, `(i32.const ${expr.value ? '1' : '0'})`);
+      break;
 
     case 'Identifier':
       if (ctx.globals.has(expr.name)) {
@@ -651,64 +429,100 @@ function generateExpr(ctx: CodeGenContext, expr: Expr): void {
 
     case 'BinaryExpr': {
       const leftType = inferExprType(ctx, expr.left);
-      const rightType = inferExprType(ctx, expr.right);
-      const opResult = resolveBinaryOp(expr.op, leftType, rightType, expr.left, expr.right);
+      const prefix = getWatPrefix(leftType);
+      const isFloat = prefix === 'f64' || prefix === 'f32';
 
-      if (!opResult) {
-        // Type error - incompatible types for this operation
-        emit(ctx, `;; ERROR: incompatible types for ${expr.op}`);
-        break;
-      }
-
-      // Generate left operand, then convert if needed
       generateExpr(ctx, expr.left);
-      if (opResult.convertLeft) {
-        emit(ctx, `(${opResult.convertLeft})`);
-      }
-
-      // Generate right operand, then convert if needed
       generateExpr(ctx, expr.right);
-      if (opResult.convertRight) {
-        emit(ctx, `(${opResult.convertRight})`);
-      }
 
-      emit(ctx, `(${opResult.op})`);
+      const opMap: Record<string, string> = {
+        '+': `${prefix}.add`,
+        '-': `${prefix}.sub`,
+        '*': `${prefix}.mul`,
+        '/': isFloat ? `${prefix}.div` : `${prefix}.div_s`,
+        '%': `${prefix}.rem_s`,
+        '&': `${prefix}.and`,
+        '|': `${prefix}.or`,
+        '^': `${prefix}.xor`,
+        '<<': `${prefix}.shl`,
+        '>>': `${prefix}.shr_s`,
+        '<': isFloat ? `${prefix}.lt` : `${prefix}.lt_s`,
+        '>': isFloat ? `${prefix}.gt` : `${prefix}.gt_s`,
+        '<=': isFloat ? `${prefix}.le` : `${prefix}.le_s`,
+        '>=': isFloat ? `${prefix}.ge` : `${prefix}.ge_s`,
+        '==': `${prefix}.eq`,
+        '!=': `${prefix}.ne`,
+      };
+      emit(ctx, `(${opMap[expr.op] || `${prefix}.add`})`);
       break;
     }
 
-    case 'CallExpr': {
-      // Check if this is a builtin function (WASM instruction)
-      const builtinOps: Record<string, string> = {
-        sqrt: 'f64.sqrt',
-        abs: 'f64.abs',
-        ceil: 'f64.ceil',
-        floor: 'f64.floor',
-        trunc: 'f64.trunc',
-        nearest: 'f64.nearest',
-        min: 'f64.min',
-        max: 'f64.max',
-        copysign: 'f64.copysign',
-      };
-
-      for (const arg of expr.args) {
-        generateExpr(ctx, arg);
-      }
-
-      if (expr.callee.kind === 'Identifier') {
-        const builtinOp = builtinOps[expr.callee.name];
-        if (builtinOp) {
-          emit(ctx, `(${builtinOp})`);
+    case 'UnaryExpr':
+      generateExpr(ctx, expr.operand);
+      if (expr.op === '-') {
+        const type = inferExprType(ctx, expr.operand);
+        const prefix = getWatPrefix(type);
+        if (prefix === 'f64' || prefix === 'f32') {
+          emit(ctx, `(${prefix}.neg)`);
         } else {
-          emit(ctx, `(call $${expr.callee.name})`);
+          emit(ctx, `(${prefix}.const -1)`);
+          emit(ctx, `(${prefix}.mul)`);
+        }
+      } else if (expr.op === '!') {
+        emit(ctx, '(i32.eqz)');
+      }
+      break;
+
+    case 'CallExpr': {
+      for (const arg of expr.args) {
+        generateExpr(ctx, arg.value);
+      }
+      if (expr.callee.kind === 'Identifier') {
+        const name = expr.callee.name;
+        // Float builtins (default to f64)
+        const floatBuiltins: Record<string, string> = {
+          sqrt: 'f64.sqrt', abs: 'f64.abs', ceil: 'f64.ceil',
+          floor: 'f64.floor', trunc: 'f64.trunc', nearest: 'f64.nearest',
+          min: 'f64.min', max: 'f64.max', copysign: 'f64.copysign',
+        };
+        // Integer builtins (default to i32)
+        const intBuiltins: Record<string, string> = {
+          clz: 'i32.clz', ctz: 'i32.ctz', popcnt: 'i32.popcnt',
+        };
+        // Memory builtins
+        const memBuiltins: Record<string, string> = {
+          'memory-size': 'memory.size', 'memory-grow': 'memory.grow',
+        };
+
+        if (floatBuiltins[name]) {
+          emit(ctx, `(${floatBuiltins[name]})`);
+        } else if (intBuiltins[name]) {
+          emit(ctx, `(${intBuiltins[name]})`);
+        } else if (memBuiltins[name]) {
+          emit(ctx, `(${memBuiltins[name]})`);
+        } else {
+          emit(ctx, `(call $${name})`);
         }
       }
       break;
     }
 
-    case 'TupleExpr':
+    case 'TupleLit':
       for (const elem of expr.elements) {
-        generateExpr(ctx, elem);
+        generateExpr(ctx, elem.value);
       }
+      break;
+
+    case 'IndexExpr':
+      generateExpr(ctx, expr.target);
+      generateExpr(ctx, expr.index);
+      emit(ctx, '(i32.add)');
+      emit(ctx, '(i32.load)');
+      break;
+
+    case 'MemberExpr':
+      generateExpr(ctx, expr.target);
+      // Basic member access - would need more sophisticated handling
       break;
 
     default:
@@ -716,31 +530,13 @@ function generateExpr(ctx: CodeGenContext, expr: Expr): void {
   }
 }
 
-function typeToWat(type: Type): string {
-  switch (type.kind) {
-    case 'PrimitiveType': {
-      const name = type.name;
-      if (name === 'f64') return 'f64';
-      if (name === 'f32') return 'f32';
-      if (name === 'i64' || name === 'u64') return 'i64';
-      return 'i32';
-    }
-    case 'SliceType':
-      return 'i32 i32'; // ptr, len
-    case 'PointerType':
-      return 'i32';
-    case 'TupleType':
-      return type.elements.map(typeToWat).join(' ');
-    default:
-      return 'i32';
-  }
-}
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 
 function registerString(ctx: CodeGenContext, str: string): number {
   const existing = ctx.strings.get(str);
-  if (existing !== undefined) {
-    return existing;
-  }
+  if (existing !== undefined) return existing;
   const offset = ctx.stringOffset;
   ctx.strings.set(str, offset);
   ctx.stringOffset += str.length;

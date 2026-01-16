@@ -29,10 +29,13 @@ import {
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
-import { check, getLineAndColumn, parse } from './compile';
-import type { CheckResult, Diagnostic, Type, Symbol as EncantisSymbol, Span, FuncDecl, Module, Stmt, Expr } from './types';
+import { check, parse } from './compile';
+import type {
+  Body, CheckResult, Diagnostic, Expr, ExportDecl, FuncDecl,
+  Module, NamedReturns, Span, Stmt, Type, Symbol as EncSymbol,
+} from './types';
 
-// Cache analysis results per document for hover and rename support
+// Cache analysis results per document
 const analysisCache = new Map<string, { text: string; result: CheckResult; ast: Module }>();
 
 // -----------------------------------------------------------------------------
@@ -45,30 +48,10 @@ const documents = new TextDocuments(TextDocument);
 let hasConfigurationCapability = false;
 let hasWorkspaceFolderCapability = false;
 
-// -----------------------------------------------------------------------------
-// Semantic Tokens Legend
-// -----------------------------------------------------------------------------
-
-// Token types - order matters, these are indices
-const tokenTypes = [
-  'parameter',  // 0 - function parameters (input and named returns, distinguished by modifier)
-  'variable',   // 1 - local variables and globals (distinguished by modifier)
-  'function',   // 2 - function names
-];
-
-// Token modifiers - can be combined as bitflags
-const tokenModifiers = [
-  'declaration',  // 0 (bit 0 = 1) - where the symbol is declared
-  'static',       // 1 (bit 1 = 2) - global/static variables
-  'modification', // 2 (bit 2 = 4) - where a variable is being modified
-  'readonly',     // 3 (bit 3 = 8) - immutable variables
-  'output',       // 4 (bit 4 = 16) - named return parameters (output params)
-];
-
-const semanticTokensLegend: SemanticTokensLegend = {
-  tokenTypes,
-  tokenModifiers,
-};
+// Semantic tokens legend
+const tokenTypes = ['parameter', 'variable', 'function'];
+const tokenModifiers = ['declaration', 'static', 'modification', 'readonly', 'output'];
+const semanticTokensLegend: SemanticTokensLegend = { tokenTypes, tokenModifiers };
 
 // -----------------------------------------------------------------------------
 // Initialization
@@ -76,42 +59,20 @@ const semanticTokensLegend: SemanticTokensLegend = {
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   const capabilities = params.capabilities;
-
-  hasConfigurationCapability = !!(
-    capabilities.workspace && !!capabilities.workspace.configuration
-  );
-  hasWorkspaceFolderCapability = !!(
-    capabilities.workspace && !!capabilities.workspace.workspaceFolders
-  );
+  hasConfigurationCapability = !!(capabilities.workspace?.configuration);
+  hasWorkspaceFolderCapability = !!(capabilities.workspace?.workspaceFolders);
 
   const result: InitializeResult = {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
-      // Enable hover
       hoverProvider: true,
-      // Enable rename
-      renameProvider: {
-        prepareProvider: true,
-      },
-      // Enable semantic tokens for rich highlighting
-      semanticTokensProvider: {
-        legend: semanticTokensLegend,
-        full: true,
-      },
-      // Future: Enable completions
-      // completionProvider: {
-      //   resolveProvider: true,
-      //   triggerCharacters: ['.', ':'],
-      // },
+      renameProvider: { prepareProvider: true },
+      semanticTokensProvider: { legend: semanticTokensLegend, full: true },
     },
   };
 
   if (hasWorkspaceFolderCapability) {
-    result.capabilities.workspace = {
-      workspaceFolders: {
-        supported: true,
-      },
-    };
+    result.capabilities.workspace = { workspaceFolders: { supported: true } };
   }
 
   return result;
@@ -135,25 +96,17 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
   const text = textDocument.getText();
   const diagnostics: LSPDiagnostic[] = [];
 
-  // Run the Encantis parser and checker (use same parseResult so FuncDecl refs match)
   const parseResult = parse(text);
   const result = check(parseResult, text);
 
-  // Cache the result for hover and rename support
   analysisCache.set(textDocument.uri, { text, result, ast: parseResult.ast });
 
-  // Convert Encantis diagnostics to LSP diagnostics
   for (const diag of result.errors) {
     diagnostics.push(convertDiagnostic(text, diag));
   }
 
-  // Send diagnostics to the client
   connection.sendDiagnostics({ uri: textDocument.uri, diagnostics });
 }
-
-// -----------------------------------------------------------------------------
-// Diagnostic Conversion
-// -----------------------------------------------------------------------------
 
 function convertDiagnostic(src: string, diag: Diagnostic): LSPDiagnostic {
   const startPos = getLineAndColumn(src, diag.span.start);
@@ -161,17 +114,9 @@ function convertDiagnostic(src: string, diag: Diagnostic): LSPDiagnostic {
 
   let severity: DiagnosticSeverity;
   switch (diag.severity) {
-    case 'error':
-      severity = DiagnosticSeverity.Error;
-      break;
-    case 'warning':
-      severity = DiagnosticSeverity.Warning;
-      break;
-    case 'info':
-      severity = DiagnosticSeverity.Information;
-      break;
-    default:
-      severity = DiagnosticSeverity.Error;
+    case 'error': severity = DiagnosticSeverity.Error; break;
+    case 'warning': severity = DiagnosticSeverity.Warning; break;
+    default: severity = DiagnosticSeverity.Information;
   }
 
   return {
@@ -185,6 +130,18 @@ function convertDiagnostic(src: string, diag: Diagnostic): LSPDiagnostic {
   };
 }
 
+function getLineAndColumn(src: string, offset: number): { line: number; column: number } {
+  let line = 1;
+  let lastNewline = -1;
+  for (let i = 0; i < offset && i < src.length; i++) {
+    if (src[i] === '\n') {
+      line++;
+      lastNewline = i;
+    }
+  }
+  return { line, column: offset - lastNewline };
+}
+
 // -----------------------------------------------------------------------------
 // Hover Provider
 // -----------------------------------------------------------------------------
@@ -195,35 +152,28 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
 
   const text = document.getText();
   const offset = document.offsetAt(params.position);
-
-  // Get the word at the position
   const word = getWordAtOffset(text, offset);
   if (!word) return null;
 
-  // Check for builtins
+  // Builtin docs
   const builtinDocs: Record<string, string> = {
-    sqrt: '```encantis\nfunc sqrt(x: f64) -> f64\n```\nReturns the square root of x. Maps to `f64.sqrt` WASM instruction.',
-    abs: '```encantis\nfunc abs(x: f64) -> f64\n```\nReturns the absolute value of x. Maps to `f64.abs` WASM instruction.',
-    ceil: '```encantis\nfunc ceil(x: f64) -> f64\n```\nRounds x up to the nearest integer. Maps to `f64.ceil` WASM instruction.',
-    floor: '```encantis\nfunc floor(x: f64) -> f64\n```\nRounds x down to the nearest integer. Maps to `f64.floor` WASM instruction.',
-    trunc: '```encantis\nfunc trunc(x: f64) -> f64\n```\nTruncates x toward zero. Maps to `f64.trunc` WASM instruction.',
-    nearest: '```encantis\nfunc nearest(x: f64) -> f64\n```\nRounds x to the nearest integer. Maps to `f64.nearest` WASM instruction.',
-    min: '```encantis\nfunc min(a: f64, b: f64) -> f64\n```\nReturns the minimum of a and b. Maps to `f64.min` WASM instruction.',
-    max: '```encantis\nfunc max(a: f64, b: f64) -> f64\n```\nReturns the maximum of a and b. Maps to `f64.max` WASM instruction.',
-    copysign: '```encantis\nfunc copysign(x: f64, y: f64) -> f64\n```\nReturns x with the sign of y. Maps to `f64.copysign` WASM instruction.',
-  };
-
-  // Check for keywords
-  const keywordDocs: Record<string, string> = {
-    func: 'Declares a function.\n\n```encantis\nfunc name(params) -> ReturnType\n  body\nend\n```',
-    local: 'Declares a local variable.\n\n```encantis\nlocal x: i32 = 42\nlocal y = inferred_value\n```',
-    import: 'Imports functions from an external module.\n\n```encantis\nimport "module" (\n  "name" func (params) -> Return\n)\n```',
-    export: 'Exports a function or memory for external use.\n\n```encantis\nexport "name"\nfunc (params) -> Return => body\n```',
-    if: 'Conditional statement.\n\n```encantis\nif condition then\n  body\nelse\n  body\nend\n```',
-    while: 'Loop while condition is true.\n\n```encantis\nwhile condition do\n  body\nend\n```',
-    for: 'Iterate over a range or collection.\n\n```encantis\nfor i in 10 do\n  body\nend\n```',
-    return: 'Returns a value from a function.\n\n```encantis\nreturn value\nreturn when condition\n```',
-    end: 'Ends a block (function, if, while, for, etc.).',
+    // Float builtins
+    sqrt: '```encantis\nfunc sqrt(x: f32/f64) -> same\n```\nSquare root. Maps to WASM `f32.sqrt`/`f64.sqrt`.',
+    abs: '```encantis\nfunc abs(x: f32/f64) -> same\n```\nAbsolute value. Maps to WASM `f32.abs`/`f64.abs`.',
+    ceil: '```encantis\nfunc ceil(x: f32/f64) -> same\n```\nRound up to nearest integer. Maps to WASM `f32.ceil`/`f64.ceil`.',
+    floor: '```encantis\nfunc floor(x: f32/f64) -> same\n```\nRound down to nearest integer. Maps to WASM `f32.floor`/`f64.floor`.',
+    trunc: '```encantis\nfunc trunc(x: f32/f64) -> same\n```\nTruncate toward zero. Maps to WASM `f32.trunc`/`f64.trunc`.',
+    nearest: '```encantis\nfunc nearest(x: f32/f64) -> same\n```\nRound to nearest even (banker\'s rounding). Maps to WASM `f32.nearest`/`f64.nearest`.',
+    min: '```encantis\nfunc min(a: f32/f64, b: f32/f64) -> same\n```\nMinimum of two values. Maps to WASM `f32.min`/`f64.min`.',
+    max: '```encantis\nfunc max(a: f32/f64, b: f32/f64) -> same\n```\nMaximum of two values. Maps to WASM `f32.max`/`f64.max`.',
+    copysign: '```encantis\nfunc copysign(x: f32/f64, y: f32/f64) -> same\n```\nCopy sign of y to x. Maps to WASM `f32.copysign`/`f64.copysign`.',
+    // Integer builtins
+    clz: '```encantis\nfunc clz(x: i32/i64/u32/u64) -> u8\n```\nCount leading zeros (0 to bit width). Maps to WASM `i32.clz`/`i64.clz`.',
+    ctz: '```encantis\nfunc ctz(x: i32/i64/u32/u64) -> u8\n```\nCount trailing zeros (0 to bit width). Maps to WASM `i32.ctz`/`i64.ctz`.',
+    popcnt: '```encantis\nfunc popcnt(x: i32/i64/u32/u64) -> u8\n```\nPopulation count (number of 1 bits). Maps to WASM `i32.popcnt`/`i64.popcnt`.',
+    // Memory builtins
+    'memory-size': '```encantis\nfunc memory-size() -> i32\n```\nCurrent memory size in pages (64KB each). Maps to WASM `memory.size`.',
+    'memory-grow': '```encantis\nfunc memory-grow(n: i32) -> i32\n```\nGrow memory by n pages. Returns previous size or -1 on failure. Maps to WASM `memory.grow`.',
   };
 
   // Type docs
@@ -234,33 +184,27 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     u64: '64-bit unsigned integer',
     f32: '32-bit floating point',
     f64: '64-bit floating point',
-    u8: '8-bit unsigned integer (byte)',
+    u8: '8-bit unsigned integer',
     i8: '8-bit signed integer',
     u16: '16-bit unsigned integer',
     i16: '16-bit signed integer',
   };
 
-  const doc = builtinDocs[word] || keywordDocs[word] || typeDocs[word];
+  const doc = builtinDocs[word] || typeDocs[word];
   if (doc) {
-    return {
-      contents: {
-        kind: MarkupKind.Markdown,
-        value: doc,
-      },
-    };
+    return { contents: { kind: MarkupKind.Markdown, value: doc } };
   }
 
-  // Look up identifier in symbol table
+  // Look up symbol
   const cached = analysisCache.get(params.textDocument.uri);
   if (cached) {
     const symbol = findSymbol(cached.result, word);
     if (symbol) {
       const typeStr = symbol.type ? typeToString(symbol.type) : 'unknown';
-      const kindLabel = symbol.kind === 'param' ? 'parameter' : symbol.kind;
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `\`\`\`encantis\n(${kindLabel}) ${word}: ${typeStr}\n\`\`\``,
+          value: `\`\`\`encantis\n(${symbol.kind}) ${word}: ${typeStr}\n\`\`\``,
         },
       };
     }
@@ -269,53 +213,36 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
   return null;
 });
 
-function findSymbol(result: CheckResult, name: string): EncantisSymbol | undefined {
-  // Check global scope first
+function findSymbol(result: CheckResult, name: string): EncSymbol | undefined {
   const globalSym = result.symbols.global.symbols.get(name);
   if (globalSym) return globalSym;
-
-  // Check all function scopes
   for (const [, scope] of result.symbols.scopes) {
     const sym = scope.symbols.get(name);
     if (sym) return sym;
   }
-
   return undefined;
 }
 
 function typeToString(type: Type): string {
   switch (type.kind) {
-    case 'PrimitiveType':
-      return type.name;
-    case 'SliceType':
-      return `[${typeToString(type.element)}]`;
-    case 'PointerType':
-      return `*${typeToString(type.target)}`;
+    case 'PrimitiveType': return type.name;
+    case 'SliceType': return `[${typeToString(type.element)}]`;
+    case 'PointerType': return `*${typeToString(type.target)}`;
     case 'TupleType':
-      if (type.elements.length === 0) return '()';
-      return `(${type.elements.map(typeToString).join(', ')})`;
-    case 'FunctionType': {
-      const params = type.params.map(typeToString).join(', ');
-      const ret = typeToString(type.returns);
-      return `(${params}) -> ${ret}`;
-    }
-    default:
-      return '?';
+      return type.elements.length === 0 ? '()' : `(${type.elements.map(typeToString).join(', ')})`;
+    case 'StructType':
+      return `(${type.fields.map(f => `${f.name}: ${typeToString(f.type)}`).join(', ')})`;
+    case 'NamedType': return type.name;
+    case 'ArrayType': return `[${typeToString(type.element)}*${type.length}]`;
+    default: return '?';
   }
 }
 
 function getWordAtOffset(text: string, offset: number): string | null {
-  // Find word boundaries
   let start = offset;
   let end = offset;
-
-  while (start > 0 && isWordChar(text[start - 1])) {
-    start--;
-  }
-  while (end < text.length && isWordChar(text[end])) {
-    end++;
-  }
-
+  while (start > 0 && isWordChar(text[start - 1])) start--;
+  while (end < text.length && isWordChar(text[end])) end++;
   if (start === end) return null;
   return text.slice(start, end);
 }
@@ -334,41 +261,31 @@ connection.onPrepareRename((params: PrepareRenameParams): Range | null => {
 
   const text = document.getText();
   const offset = document.offsetAt(params.position);
-
-  // Get the word boundaries at the position
   const wordRange = getWordRangeAtOffset(text, offset);
   if (!wordRange) return null;
 
   const word = text.slice(wordRange.start, wordRange.end);
 
-  // Check if it's a renameable symbol (not a keyword, builtin, or type)
   const keywords = new Set([
-    'import', 'export', 'func', 'local', 'global', 'end',
-    'if', 'then', 'elif', 'else', 'while', 'do', 'for', 'in',
-    'loop', 'return', 'when', 'and', 'or', 'not', 'as',
-    'memory', 'define', 'interface', 'type', 'break', 'br', 'mut',
+    'import', 'export', 'func', 'let', 'set', 'global',
+    'if', 'elif', 'else', 'while', 'for', 'in', 'loop',
+    'return', 'when', 'break', 'continue', 'memory', 'type',
   ]);
 
   const builtins = new Set([
     'sqrt', 'abs', 'ceil', 'floor', 'trunc', 'nearest', 'min', 'max', 'copysign',
+    'clz', 'ctz', 'popcnt', 'memory-size', 'memory-grow',
   ]);
+  const types = new Set(['i32', 'u32', 'i64', 'u64', 'f32', 'f64', 'u8', 'i8', 'u16', 'i16']);
 
-  const types = new Set([
-    'i32', 'u32', 'i64', 'u64', 'f32', 'f64', 'u8', 'i8', 'u16', 'i16',
-  ]);
+  if (keywords.has(word) || builtins.has(word) || types.has(word)) return null;
 
-  if (keywords.has(word) || builtins.has(word) || types.has(word)) {
-    return null; // Cannot rename keywords, builtins, or types
-  }
-
-  // Check if this symbol exists in our analysis
   const cached = analysisCache.get(params.textDocument.uri);
   if (!cached) return null;
 
   const symbol = findSymbol(cached.result, word);
   if (!symbol) return null;
 
-  // Return the range of the word
   const startPos = getLineAndColumn(text, wordRange.start);
   const endPos = getLineAndColumn(text, wordRange.end);
 
@@ -384,34 +301,24 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
 
   const text = document.getText();
   const offset = document.offsetAt(params.position);
-
-  // Get the word at the position
   const word = getWordAtOffset(text, offset);
   if (!word) return null;
 
-  // Find the symbol to determine its scope
   const cached = analysisCache.get(params.textDocument.uri);
   if (!cached) return null;
 
-  // Find which function contains the cursor (if any)
   const containingFunc = findFunctionAtOffset(cached.ast, offset);
-
-  // Find the symbol and its scope
   const symbolInfo = findSymbolWithScope(cached.result, word, containingFunc);
   if (!symbolInfo) return null;
 
-  // Determine the rename boundaries based on symbol scope
   let scopeStart = 0;
   let scopeEnd = text.length;
 
   if (symbolInfo.funcSpan) {
-    // Local/param symbol - only rename within this function
     scopeStart = symbolInfo.funcSpan.start;
     scopeEnd = symbolInfo.funcSpan.end;
   }
-  // Global symbols rename everywhere (scopeStart/scopeEnd remain as full document)
 
-  // Find all occurrences of this identifier within the scope
   const edits: TextEdit[] = [];
   const regex = new RegExp(`\\b${escapeRegex(word)}\\b`, 'g');
   const matches = text.matchAll(regex);
@@ -420,11 +327,8 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
     if (match.index === undefined) continue;
     const matchStart = match.index;
     const matchEnd = matchStart + word.length;
-
-    // Skip matches outside the scope
     if (matchStart < scopeStart || matchEnd > scopeEnd) continue;
 
-    // Convert to LSP positions
     const startPos = getLineAndColumn(text, matchStart);
     const endPos = getLineAndColumn(text, matchEnd);
 
@@ -438,25 +342,14 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   }
 
   if (edits.length === 0) return null;
-
-  return {
-    changes: {
-      [params.textDocument.uri]: edits,
-    },
-  };
+  return { changes: { [params.textDocument.uri]: edits } };
 });
 
 function getWordRangeAtOffset(text: string, offset: number): { start: number; end: number } | null {
   let start = offset;
   let end = offset;
-
-  while (start > 0 && isWordChar(text[start - 1])) {
-    start--;
-  }
-  while (end < text.length && isWordChar(text[end])) {
-    end++;
-  }
-
+  while (start > 0 && isWordChar(text[start - 1])) start--;
+  while (end < text.length && isWordChar(text[end])) end++;
   if (start === end) return null;
   return { start, end };
 }
@@ -465,23 +358,18 @@ function findSymbolWithScope(
   result: CheckResult,
   name: string,
   containingFunc: FuncDecl | undefined
-): { symbol: EncantisSymbol; isGlobal: boolean; funcSpan?: Span } | undefined {
-  // If we're inside a function, check that function's scope first
+): { symbol: EncSymbol; isGlobal: boolean; funcSpan?: Span } | undefined {
   if (containingFunc) {
     const funcScope = result.symbols.scopes.get(containingFunc);
     if (funcScope) {
       const sym = funcScope.symbols.get(name);
-      if (sym) {
-        return { symbol: sym, isGlobal: false, funcSpan: containingFunc.span };
-      }
+      if (sym) return { symbol: sym, isGlobal: false, funcSpan: containingFunc.span };
     }
   }
 
-  // Check global scope
   const globalSym = result.symbols.global.symbols.get(name);
   if (globalSym) return { symbol: globalSym, isGlobal: true };
 
-  // Check all function scopes (fallback for edge cases)
   for (const [func, scope] of result.symbols.scopes) {
     const sym = scope.symbols.get(name);
     if (sym) return { symbol: sym, isGlobal: false, funcSpan: func.span };
@@ -491,22 +379,17 @@ function findSymbolWithScope(
 }
 
 function findFunctionAtOffset(ast: Module, offset: number): FuncDecl | undefined {
-  // Check exported functions
-  for (const exp of ast.exports) {
-    if (exp.decl.kind === 'FuncDecl') {
-      if (offset >= exp.decl.span.start && offset <= exp.decl.span.end) {
-        return exp.decl;
+  for (const decl of ast.decls) {
+    if (decl.kind === 'ExportDecl' && decl.decl.kind === 'FuncDecl') {
+      if (offset >= decl.decl.span.start && offset <= decl.decl.span.end) {
+        return decl.decl;
+      }
+    } else if (decl.kind === 'FuncDecl') {
+      if (offset >= decl.span.start && offset <= decl.span.end) {
+        return decl;
       }
     }
   }
-
-  // Check non-exported functions
-  for (const func of ast.functions) {
-    if (offset >= func.span.start && offset <= func.span.end) {
-      return func;
-    }
-  }
-
   return undefined;
 }
 
@@ -530,146 +413,116 @@ connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticT
   const ast = cached.ast;
   const symbols = cached.result.symbols;
 
-  // Collect all tokens to emit, sorted by position
-  const tokens: Array<{
-    span: Span;
-    type: number;
-    modifiers: number;
-  }> = [];
-
-  // Helper to add a token
-  const addToken = (span: Span, type: number, modifiers: number = 0) => {
+  const tokens: Array<{ span: Span; type: number; modifiers: number }> = [];
+  const addToken = (span: Span, type: number, modifiers = 0) => {
     tokens.push({ span, type, modifiers });
   };
 
-  // Process global declarations
-  for (const global of ast.globals) {
-    // Find the name span within the global declaration
-    // Format: "global name = value" or "global name: type = value"
-    const declText = text.slice(global.span.start, global.span.end);
-    const match = declText.match(/^global\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
-    if (match) {
-      const nameStart = global.span.start + declText.indexOf(match[1]);
-      const nameEnd = nameStart + match[1].length;
-      addToken({ start: nameStart, end: nameEnd }, 1, 2 | 1); // variable + static + declaration
+  // Process all declarations
+  for (const decl of ast.decls) {
+    if (decl.kind === 'GlobalDecl') {
+      const declText = text.slice(decl.span.start, decl.span.end);
+      const match = declText.match(/^global\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
+      if (match) {
+        const nameStart = decl.span.start + declText.indexOf(match[1]);
+        addToken({ start: nameStart, end: nameStart + match[1].length }, 1, 3); // variable + static + declaration
+      }
+    } else if (decl.kind === 'ExportDecl' && decl.decl.kind === 'FuncDecl') {
+      processFunction(decl.decl);
+    } else if (decl.kind === 'FuncDecl') {
+      processFunction(decl);
     }
-  }
-
-  // Process exports and their function declarations
-  for (const exp of ast.exports) {
-    if (exp.decl.kind === 'FuncDecl') {
-      processFunction(exp.decl);
-    }
-  }
-
-  // Process non-exported functions
-  for (const func of ast.functions) {
-    processFunction(func);
   }
 
   function processFunction(func: FuncDecl) {
-    // Function name (if named)
+    // Function name
     if (func.name) {
       const funcText = text.slice(func.span.start, func.span.end);
-      const nameMatch = funcText.match(/^func\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
+      const nameMatch = funcText.match(/^(?:inline\s+)?func\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
       if (nameMatch) {
         const nameStart = func.span.start + funcText.indexOf(nameMatch[1]);
-        const nameEnd = nameStart + nameMatch[1].length;
-        addToken({ start: nameStart, end: nameEnd }, 2, 1); // function + declaration
+        addToken({ start: nameStart, end: nameStart + nameMatch[1].length }, 2, 1); // function + declaration
       }
     }
 
-    // Collect named return names first (for checking if input params are also outputs)
+    // Collect named return names
     const namedReturnNames = new Set<string>();
-    if (func.returnType && 'params' in func.returnType) {
-      const namedReturn = func.returnType as { params: Array<{ name: string; type: Type; span: Span }> };
-      for (const ret of namedReturn.params) {
+    const returns = func.signature.returns;
+    if (returns && 'kind' in returns && returns.kind === 'NamedReturns') {
+      for (const ret of (returns as NamedReturns).fields) {
         namedReturnNames.add(ret.name);
       }
     }
 
-    // Parameters - use their spans from the AST
-    // If param name is also a named return, tag it with output modifier
-    for (const param of func.params) {
-      if (param.span) {
+    // Parameters
+    for (const param of func.signature.params) {
+      if (param.name && param.span) {
         const isAlsoOutput = namedReturnNames.has(param.name);
-        const modifiers = isAlsoOutput ? (1 | 16) : 1; // declaration + (output if applicable)
-        // The param span includes the type annotation, we need just the name
+        const modifiers = isAlsoOutput ? (1 | 16) : 1;
         const paramText = text.slice(param.span.start, param.span.end);
         const colonIdx = paramText.indexOf(':');
         if (colonIdx > 0) {
-          const nameEnd = param.span.start + colonIdx;
-          addToken({ start: param.span.start, end: nameEnd }, 0, modifiers); // parameter
+          addToken({ start: param.span.start, end: param.span.start + colonIdx }, 0, modifiers);
         } else {
-          // No type annotation, whole span is the name
-          addToken(param.span, 0, modifiers); // parameter
+          addToken(param.span, 0, modifiers);
         }
       }
     }
 
-    // Named return values like -> (h64: u64)
-    // Always tag these as parameter + declaration + output
-    if (func.returnType && 'params' in func.returnType) {
-      const namedReturn = func.returnType as { params: Array<{ name: string; type: Type; span: Span }> };
-      for (const ret of namedReturn.params) {
-        // The span covers "name: type", extract just the name part
+    // Named returns
+    if (returns && 'kind' in returns && returns.kind === 'NamedReturns') {
+      for (const ret of (returns as NamedReturns).fields) {
         const retText = text.slice(ret.span.start, ret.span.end);
         const colonIdx = retText.indexOf(':');
         if (colonIdx > 0) {
-          const nameEnd = ret.span.start + colonIdx;
-          addToken({ start: ret.span.start, end: nameEnd }, 0, 1 | 16); // parameter + declaration + output
+          addToken({ start: ret.span.start, end: ret.span.start + colonIdx }, 0, 1 | 16);
         }
       }
     }
 
-    // Get function's scope to identify locals vs params
     const funcScope = symbols.scopes.get(func);
     const localSymbols = funcScope?.symbols || new Map();
 
-    // Process body - this is where identifiers live with accurate spans
-    if (func.body) {
-      if (func.body.kind === 'ArrowBody') {
-        for (const expr of func.body.exprs) {
-          processExpr(expr, localSymbols, namedReturnNames);
-        }
-      } else {
-        for (const stmt of func.body.stmts) {
-          processStmt(stmt, localSymbols, namedReturnNames);
-        }
+    // Process body
+    processBody(func.body, localSymbols, namedReturnNames);
+  }
+
+  function processBody(body: Body, localSymbols: Map<string, EncSymbol>, namedReturnNames: Set<string>) {
+    if (body.kind === 'ArrowBody') {
+      processExpr(body.expr, localSymbols, namedReturnNames);
+    } else {
+      for (const stmt of body.stmts) {
+        processStmt(stmt, localSymbols, namedReturnNames);
       }
     }
   }
 
-  function processStmt(stmt: Stmt, localSymbols: Map<string, EncantisSymbol>, namedReturnNames: Set<string>) {
+  function processStmt(stmt: Stmt, localSymbols: Map<string, EncSymbol>, namedReturnNames: Set<string>) {
     switch (stmt.kind) {
-      case 'LocalDecl': {
-        // Tag the local variable name
-        const localText = text.slice(stmt.span.start, stmt.span.end);
-        const localMatch = localText.match(/^local\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
-        if (localMatch) {
-          const nameStart = stmt.span.start + localText.indexOf(localMatch[1]);
-          const nameEnd = nameStart + localMatch[1].length;
-          addToken({ start: nameStart, end: nameEnd }, 1, 1); // variable + declaration
+      case 'LetStmt': {
+        if (stmt.pattern.kind === 'IdentPattern') {
+          const localText = text.slice(stmt.span.start, stmt.span.end);
+          const localMatch = localText.match(/^let\s+([a-zA-Z_][a-zA-Z0-9_-]*)/);
+          if (localMatch) {
+            const nameStart = stmt.span.start + localText.indexOf(localMatch[1]);
+            addToken({ start: nameStart, end: nameStart + localMatch[1].length }, 1, 1);
+          }
         }
-        if (stmt.init) {
-          processExpr(stmt.init, localSymbols, namedReturnNames);
-        }
+        if (stmt.init) processExpr(stmt.init, localSymbols, namedReturnNames);
         break;
       }
 
-      case 'Assignment':
-        // Assignment targets are Identifier nodes with spans
-        for (const target of stmt.targets) {
-          if (target.span) {
-            // Named returns are parameter + output modifier, regular params just parameter
-            if (namedReturnNames.has(target.name)) {
-              addToken(target.span, 0, 4 | 16); // parameter + modification + output
-            } else if (localSymbols.get(target.name)?.kind === 'param') {
-              addToken(target.span, 0, 4); // parameter + modification
-            } else {
-              addToken(target.span, 1, 4); // variable + modification
-            }
+      case 'AssignStmt':
+        if (stmt.target.kind === 'Identifier' && stmt.target.span) {
+          if (namedReturnNames.has(stmt.target.name)) {
+            addToken(stmt.target.span, 0, 4 | 16);
+          } else if (localSymbols.get(stmt.target.name)?.kind === 'param') {
+            addToken(stmt.target.span, 0, 4);
+          } else {
+            addToken(stmt.target.span, 1, 4);
           }
+        } else {
+          processExpr(stmt.target, localSymbols, namedReturnNames);
         }
         processExpr(stmt.value, localSymbols, namedReturnNames);
         break;
@@ -679,67 +532,52 @@ connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticT
         break;
 
       case 'ReturnStmt':
-        if (stmt.value) {
-          processExpr(stmt.value, localSymbols, namedReturnNames);
-        }
+        if (stmt.value) processExpr(stmt.value, localSymbols, namedReturnNames);
         break;
 
       case 'IfStmt':
         processExpr(stmt.condition, localSymbols, namedReturnNames);
-        for (const s of stmt.thenBody) {
-          processStmt(s, localSymbols, namedReturnNames);
+        processBody(stmt.thenBody, localSymbols, namedReturnNames);
+        for (const elif of stmt.elifClauses) {
+          processExpr(elif.condition, localSymbols, namedReturnNames);
+          processBody(elif.body, localSymbols, namedReturnNames);
         }
-        if (stmt.elseBody) {
-          for (const s of stmt.elseBody) {
-            processStmt(s, localSymbols, namedReturnNames);
-          }
-        }
+        if (stmt.elseBody) processBody(stmt.elseBody, localSymbols, namedReturnNames);
         break;
 
       case 'WhileStmt':
         processExpr(stmt.condition, localSymbols, namedReturnNames);
-        for (const s of stmt.body) {
-          processStmt(s, localSymbols, namedReturnNames);
-        }
+        processBody(stmt.body, localSymbols, namedReturnNames);
         break;
 
       case 'LoopStmt':
-        for (const s of stmt.body) {
-          processStmt(s, localSymbols, namedReturnNames);
-        }
+        processBody(stmt.body, localSymbols, namedReturnNames);
         break;
 
       case 'ForStmt':
         processExpr(stmt.iterable, localSymbols, namedReturnNames);
-        for (const s of stmt.body) {
-          processStmt(s, localSymbols, namedReturnNames);
-        }
+        processBody(stmt.body, localSymbols, namedReturnNames);
         break;
     }
   }
 
-  function processExpr(expr: Expr, localSymbols: Map<string, EncantisSymbol>, namedReturnNames: Set<string>) {
+  function processExpr(expr: Expr, localSymbols: Map<string, EncSymbol>, namedReturnNames: Set<string>) {
     switch (expr.kind) {
       case 'Identifier':
         if (expr.span) {
-          // Named returns are parameter + output modifier
           if (namedReturnNames.has(expr.name)) {
-            addToken(expr.span, 0, 16); // parameter + output
+            addToken(expr.span, 0, 16);
           } else {
             const sym = localSymbols.get(expr.name);
             if (sym) {
-              // Local variable or parameter
-              const tokenType = sym.kind === 'param' ? 0 : 1;
-              addToken(expr.span, tokenType, 0);
+              addToken(expr.span, sym.kind === 'param' ? 0 : 1, 0);
             } else {
-              // Check global scope
               const globalSym = symbols.global.symbols.get(expr.name);
               if (globalSym) {
                 if (globalSym.kind === 'function' || globalSym.kind === 'builtin') {
-                  addToken(expr.span, 2, 0); // function
+                  addToken(expr.span, 2, 0);
                 } else {
-                  // Global variable: use 'variable' type with 'static' modifier
-                  addToken(expr.span, 1, 2); // variable + static (bit 1)
+                  addToken(expr.span, 1, 2);
                 }
               }
             }
@@ -759,20 +597,20 @@ connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticT
       case 'CallExpr':
         processExpr(expr.callee, localSymbols, namedReturnNames);
         for (const arg of expr.args) {
-          processExpr(arg, localSymbols, namedReturnNames);
+          processExpr(arg.value, localSymbols, namedReturnNames);
         }
         break;
 
       case 'MemberExpr':
-        processExpr(expr.object, localSymbols, namedReturnNames);
+        processExpr(expr.target, localSymbols, namedReturnNames);
         break;
 
       case 'IndexExpr':
-        processExpr(expr.object, localSymbols, namedReturnNames);
+        processExpr(expr.target, localSymbols, namedReturnNames);
         processExpr(expr.index, localSymbols, namedReturnNames);
         break;
 
-      case 'TupleExpr':
+      case 'TupleLit':
         for (const elem of expr.elements) {
           processExpr(elem, localSymbols, namedReturnNames);
         }
@@ -784,21 +622,12 @@ connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticT
     }
   }
 
-  // Sort tokens by position (required by LSP)
+  // Sort and emit tokens
   tokens.sort((a, b) => a.span.start - b.span.start);
-
-  // Emit tokens using the builder
   for (const token of tokens) {
     const startPos = getLineAndColumn(text, token.span.start);
     const length = token.span.end - token.span.start;
-
-    builder.push(
-      startPos.line - 1,    // 0-based line
-      startPos.column - 1,  // 0-based character
-      length,
-      token.type,
-      token.modifiers
-    );
+    builder.push(startPos.line - 1, startPos.column - 1, length, token.type, token.modifiers);
   }
 
   return builder.build();
@@ -809,7 +638,6 @@ connection.languages.semanticTokens.on((params: SemanticTokensParams): SemanticT
 // -----------------------------------------------------------------------------
 
 documents.onDidClose(e => {
-  // Clear diagnostics when document is closed
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
 });
 

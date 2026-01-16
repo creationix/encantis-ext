@@ -1,7 +1,7 @@
 "use strict";
 // =============================================================================
 // Encantis VS Code Extension
-// Provides language support for .ents files via LSP
+// Provides syntax highlighting, LSP, and WAT preview for .ents files
 // =============================================================================
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -39,40 +39,24 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
-const path = __importStar(require("path"));
+const path = __importStar(require("node:path"));
 const vscode = __importStar(require("vscode"));
 const node_1 = require("vscode-languageclient/node");
 const watPreviewProvider_1 = require("./watPreviewProvider");
 let client;
 function activate(context) {
-    // Path to the server module
+    // -------------------------------------------------------------------------
+    // Language Server
+    // -------------------------------------------------------------------------
     const serverModule = context.asAbsolutePath(path.join('out', 'server', 'lsp.js'));
-    // Server options - run the server as a separate Node process
     const serverOptions = {
-        run: {
-            module: serverModule,
-            transport: node_1.TransportKind.stdio,
-        },
-        debug: {
-            module: serverModule,
-            transport: node_1.TransportKind.stdio,
-            options: { execArgv: ['--nolazy', '--inspect=6009'] },
-        },
+        run: { module: serverModule, transport: node_1.TransportKind.ipc },
+        debug: { module: serverModule, transport: node_1.TransportKind.ipc },
     };
-    // Client options - register for .ents files
     const clientOptions = {
-        documentSelector: [
-            { scheme: 'file', language: 'encantis' },
-            { scheme: 'untitled', language: 'encantis' },
-        ],
-        synchronize: {
-            // Notify the server about file changes to .ents files
-            fileEvents: undefined, // We'll rely on document sync for now
-        },
+        documentSelector: [{ scheme: 'file', language: 'encantis' }],
     };
-    // Create and start the client
-    client = new node_1.LanguageClient('encantis', 'Encantis Language Server', serverOptions, clientOptions);
-    // Start the client (also starts the server)
+    client = new node_1.LanguageClient('encantisLanguageServer', 'Encantis Language Server', serverOptions, clientOptions);
     client.start();
     // -------------------------------------------------------------------------
     // WAT Preview Feature

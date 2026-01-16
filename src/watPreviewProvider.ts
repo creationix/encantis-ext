@@ -4,7 +4,12 @@
 // =============================================================================
 
 import * as vscode from 'vscode';
-import { compile } from './server/compile';
+
+// Compiler disabled until parser is updated to match grammar spec
+// import { compile } from './server/compile';
+function compile(_src: string): string {
+  return ';; WAT preview disabled - parser is being updated to match grammar spec\n;; See docs/grammar.md for the current language specification';
+}
 
 export const WAT_SCHEME = 'encantis-wat';
 

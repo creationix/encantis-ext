@@ -25,14 +25,14 @@
         "comments": {
             "patterns": [
                 {
-                    "name": "comment.line.double-dash.encantis",
-                    "begin": "--",
+                    "name": "comment.line.double-slash.encantis",
+                    "begin": "//",
                     "end": "\n"
                 },
                 {
                     "name": "comment.block.encantis",
-                    "begin": "-<",
-                    "end": ">-"
+                    "begin": "/\\*",
+                    "end": "\\*/"
                 }
             ]
         },
@@ -44,11 +44,11 @@
                 },
                 {
                     "name": "keyword.operator.logical.encantis",
-                    "match": "&&|\\|\\||\\?\\?"
+                    "match": "&&|\\|\\||!(?!=)"
                 },
                 {
                     "name": "keyword.operator.assignment.augmented.encantis",
-                    "match": "<<<=|>>>=|%=|&=|\\*=|\\+=|-=|/=|\\^=|\\|=|<<=|>>=|\\|\\|=|\\?\\?="
+                    "match": "<<<=|>>>=|\\+\\|=|-\\|=|\\*\\|=|%=|&=|\\*=|\\+=|-=|/=|\\^=|\\|=|<<=|>>="
                 },
                 {
                     "name": "keyword.operator.bitwise.encantis",
@@ -72,7 +72,7 @@
                 },
                 {
                     "name": "keyword.operator.arithmetic.encantis",
-                    "match": "/|%|\\*|\\+|-"
+                    "match": "\\+\\||-\\||\\*\\||/|%|\\*|\\+|-"
                 }
             ]
         },
@@ -80,32 +80,34 @@
             "patterns": [
                 {
                     "name": "keyword.control.loop.encantis",
-                    "match": "\\b(loop|forever|while|for|in)(?![a-zA-Z0-9_-])"
+                    "match": "\\b(loop|while|for|in)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "keyword.control.conditional.encantis",
-                    "match": "\\b(if|then|elif|else|when|unless)(?![a-zA-Z0-9_-])"
-                },
-                {
-                    "name": "keyword.control.block.encantis",
-                    "match": "\\b(block|do|end)(?![a-zA-Z0-9_-])"
+                    "match": "\\b(if|elif|else|when|match)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "keyword.control.flow.encantis",
-                    "match": "\\b(return|br|break|continue)(?![a-zA-Z0-9_-])"
+                    "match": "\\b(return|break|continue)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "storage.type.encantis",
-                    "match": "\\b(func|memory|import|export|define|type|interface|global|local|as)(?![a-zA-Z0-9_-])"
-                },
-                {
-                    "name": "keyword.logic.encantis",
-                    "match": "\\b(or|and|not|xor)(?![a-zA-Z0-9_-])"
+                    "match": "\\b(func|inline|memory|data|import|export|def|type|unique|global|let|set|as)(?![a-zA-Z0-9_-])"
                 }
             ]
         },
         "strings": {
             "patterns": [
+                {
+                    "name": "string.quoted.other.hex.encantis",
+                    "begin": "x\"",
+                    "end": "\""
+                },
+                {
+                    "name": "string.quoted.other.base64.encantis",
+                    "begin": "b\"",
+                    "end": "\""
+                },
                 {
                     "name": "string.quoted.single.encantis",
                     "begin": "'",
@@ -158,7 +160,7 @@
                 },
                 {
                     "name": "support.function.encantis",
-                    "match": "\\b(sqrt|ceil|floor|round)(?![a-zA-Z0-9_-])"
+                    "match": "\\b(sqrt|abs|ceil|floor|trunc|nearest|min|max|copysign|clz|ctz|popcnt|memory-size|memory-grow)(?![a-zA-Z0-9_-])"
                 },
                 {
                     "name": "punctuation.accessor.tuple.encantis",

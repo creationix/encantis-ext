@@ -39,7 +39,11 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WatPreviewProvider = exports.WAT_SCHEME = void 0;
 const vscode = __importStar(require("vscode"));
-const compile_1 = require("./server/compile");
+// Compiler disabled until parser is updated to match grammar spec
+// import { compile } from './server/compile';
+function compile(_src) {
+    return ';; WAT preview disabled - parser is being updated to match grammar spec\n;; See docs/grammar.md for the current language specification';
+}
 exports.WAT_SCHEME = 'encantis-wat';
 class WatPreviewProvider {
     _onDidChange = new vscode.EventEmitter();
@@ -79,7 +83,7 @@ class WatPreviewProvider {
         const sourceUri = WatPreviewProvider.decodeUri(uri);
         return vscode.workspace.openTextDocument(sourceUri).then(doc => {
             const src = doc.getText();
-            const wat = (0, compile_1.compile)(src);
+            const wat = compile(src);
             this._cache.set(cacheKey, wat);
             return wat;
         });
